@@ -38,10 +38,8 @@ pub struct ParseResult {
     pub tasks: Vec<DanmakuTask>,
     /// 是否存在 mode=7 的高级弹幕
     pub has_mode7: bool,
-    /// 已剔除的 mode=8 弹幕数量
-    pub removed_mode8_count: usize,
-    /// 暂时剔除的 mode=9 弹幕数量
-    pub removed_mode9_count: usize,
+    /// 按 --remove 规则剔除的弹幕数量（mode, count）
+    pub removed_modes: Vec<(u8, usize)>,
     /// 严格校验时剔除的弹幕数量
     pub rigor_removed_count: usize,
 }
@@ -80,14 +78,14 @@ pub fn parse_danmaku_xml(
     xml_content: &str,
     rigor: bool,
     time_offset_ms: Option<i64>,
+    remove_modes: &[u8],
 ) -> AppResult<ParseResult> {
     let mut reader = Reader::from_str(xml_content);
     reader.config_mut().trim_text(true);
 
     let mut raw_danmakus: Vec<RawDanmaku> = Vec::new();
     let mut has_mode7 = false;
-    let mut removed_mode8_count = 0usize;
-    let mut removed_mode9_count = 0usize;
+    let mut removed_modes: Vec<(u8, usize)> = Vec::new();
     let mut buf = Vec::new();
 
     loop {
@@ -101,8 +99,8 @@ pub fn parse_danmaku_xml(
                             &mut raw_danmakus,
                             raw,
                             &mut has_mode7,
-                            &mut removed_mode8_count,
-                            &mut removed_mode9_count,
+                            &mut removed_modes,
+                            remove_modes,
                         );
                     }
                 }
@@ -118,8 +116,8 @@ pub fn parse_danmaku_xml(
                             &mut raw_danmakus,
                             raw,
                             &mut has_mode7,
-                            &mut removed_mode8_count,
-                            &mut removed_mode9_count,
+                            &mut removed_modes,
+                            remove_modes,
                         );
                     }
                 }
@@ -174,8 +172,7 @@ pub fn parse_danmaku_xml(
     Ok(ParseResult {
         tasks,
         has_mode7,
-        removed_mode8_count,
-        removed_mode9_count,
+        removed_modes,
         rigor_removed_count,
     })
 }
@@ -271,18 +268,22 @@ fn classify_and_push(
     danmakus: &mut Vec<RawDanmaku>,
     raw: RawDanmaku,
     has_mode7: &mut bool,
-    removed_mode8: &mut usize,
-    removed_mode9: &mut usize,
+    removed_modes: &mut Vec<(u8, usize)>,
+    remove_modes_rule: &[u8],
 ) {
-    match raw.mode {
-        8 => *removed_mode8 += 1,
-        9 => *removed_mode9 += 1,
-        7 => {
-            *has_mode7 = true;
-            danmakus.push(raw);
+    if remove_modes_rule.contains(&raw.mode) {
+        if let Some((_, count)) = removed_modes.iter_mut().find(|(mode, _)| *mode == raw.mode) {
+            *count += 1;
+        } else {
+            removed_modes.push((raw.mode, 1));
         }
-        _ => danmakus.push(raw),
+        return;
     }
+
+    if raw.mode == 7 {
+        *has_mode7 = true;
+    }
+    danmakus.push(raw);
 }
 
 /// 读取 <d> 标签内的文本内容
@@ -330,14 +331,27 @@ mod tests {
     <d p="3.0,1,25,16777215,3000,0,hash3,dmid3,1">弹幕3</d>
 </i>"#;
 
-        let result = parse_danmaku_xml(xml, false, None).unwrap();
+        let result = parse_danmaku_xml(xml, false, None, &[8]).unwrap();
         assert_eq!(result.tasks.len(), 2);
-        assert_eq!(result.removed_mode8_count, 1);
+        assert_eq!(result.removed_modes, vec![(8, 1)]);
         assert_eq!(result.tasks[0].msg, "弹幕1");
         assert_eq!(result.tasks[1].msg, "弹幕3");
         // 按 date 排序后 ID 从 1 开始
         assert_eq!(result.tasks[0].id, 1);
         assert_eq!(result.tasks[1].id, 2);
+    }
+
+    #[test]
+    fn test_parse_xml_with_empty_remove_rule_keeps_modes() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<i>
+    <d p="1.0,8,25,16777215,1000,0,hash1,dmid1,1">代码弹幕</d>
+    <d p="2.0,9,25,16777215,2000,0,hash2,dmid2,1">BAS弹幕</d>
+</i>"#;
+
+        let result = parse_danmaku_xml(xml, false, None, &[]).unwrap();
+        assert_eq!(result.tasks.len(), 2);
+        assert!(result.removed_modes.is_empty());
     }
 
     #[test]
@@ -348,9 +362,9 @@ mod tests {
     <d p="2.0,1,25,16777215,2000,0,hash2,dmid2,1">普通弹幕</d>
 </i>"#;
 
-        let result = parse_danmaku_xml(xml, false, None).unwrap();
+        let result = parse_danmaku_xml(xml, false, None, &[9]).unwrap();
         assert_eq!(result.tasks.len(), 1);
-        assert_eq!(result.removed_mode9_count, 1);
+        assert_eq!(result.removed_modes, vec![(9, 1)]);
     }
 
     #[test]
@@ -360,7 +374,7 @@ mod tests {
     <d p="1.0,7,25,16777215,1000,0,hash1,dmid1,1">高级弹幕</d>
 </i>"#;
 
-        let result = parse_danmaku_xml(xml, false, None).unwrap();
+        let result = parse_danmaku_xml(xml, false, None, &[]).unwrap();
         assert!(result.has_mode7);
         assert_eq!(result.tasks.len(), 1);
     }
@@ -372,7 +386,7 @@ mod tests {
     <d p="5.5,1,25,16777215,1000,0,hash1,dmid1,1">测试</d>
 </i>"#;
 
-        let result = parse_danmaku_xml(xml, false, None).unwrap();
+        let result = parse_danmaku_xml(xml, false, None, &[]).unwrap();
         assert_eq!(result.tasks[0].progress, 5500); // 5.5s → 5500ms
     }
 
@@ -383,7 +397,7 @@ mod tests {
     <d p="5.5,1,25,16777215,1000,0,hash1,dmid1,1">测试</d>
 </i>"#;
 
-        let result = parse_danmaku_xml(xml, false, Some(500)).unwrap();
+        let result = parse_danmaku_xml(xml, false, Some(500), &[]).unwrap();
         assert_eq!(result.tasks[0].progress, 6000); // 5500 + 500 = 6000ms
     }
 
@@ -394,7 +408,7 @@ mod tests {
     <d p="5.5,1,25,16777215,1000,0,hash1,dmid1,1">测试</d>
 </i>"#;
 
-        let result = parse_danmaku_xml(xml, false, Some(-2000)).unwrap();
+        let result = parse_danmaku_xml(xml, false, Some(-2000), &[]).unwrap();
         assert_eq!(result.tasks[0].progress, 3500); // 5500 - 2000 = 3500ms
     }
 
@@ -405,7 +419,7 @@ mod tests {
     <d p="0.5,1,25,16777215,1000,0,hash1,dmid1,1">测试</d>
 </i>"#;
 
-        let result = parse_danmaku_xml(xml, false, Some(-1000)).unwrap();
+        let result = parse_danmaku_xml(xml, false, Some(-1000), &[]).unwrap();
         assert_eq!(result.tasks[0].progress, 0); // 不能小于 0
     }
 }

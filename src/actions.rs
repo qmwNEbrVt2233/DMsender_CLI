@@ -9,6 +9,51 @@ use crate::core::xml_parser;
 use crate::cli::prompt::{self, ModifyChoice};
 use crate::errors::{AppError, AppResult};
 
+#[derive(Debug, Clone)]
+pub enum CreateVideoInput {
+    BvidPage { bvid: String, page: u32 },
+    Cid(u64),
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateInputs {
+    pub sessdata: String,
+    pub csrf: String,
+    pub video: CreateVideoInput,
+    pub pool: u8,
+}
+
+#[derive(Debug, Clone)]
+pub enum SendFrom {
+    Last,
+    Id(u64),
+}
+
+#[derive(Debug, Clone)]
+pub enum AutoRetry {
+    Finite(u32),
+    Infinite,
+}
+
+#[derive(Debug, Clone)]
+pub struct SendOptions {
+    pub interval_ms: Option<u64>,
+    pub send_from: Option<SendFrom>,
+    pub retry_interval_ms: u64,
+    pub auto_retry: AutoRetry,
+}
+
+impl Default for SendOptions {
+    fn default() -> Self {
+        SendOptions {
+            interval_ms: None,
+            send_from: None,
+            retry_interval_ms: 10_000,
+            auto_retry: AutoRetry::Finite(5),
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  create 命令
 // ═══════════════════════════════════════════════════════════════
@@ -17,6 +62,8 @@ pub async fn handle_create(
     rigor: bool,
     output_path: Option<String>,
     time_offset_ms: Option<i64>,
+    create_inputs: Option<CreateInputs>,
+    remove_modes: Vec<u8>,
     auto_mode: bool,
 ) -> AppResult<String> {
     println!("═══════════════════════════════════════");
@@ -31,86 +78,20 @@ pub async fn handle_create(
         xml_content.len() as f64 / 1024.0
     );
 
-    // 2. 询问 SESSDATA 和 bili_jct（在询问 bvid 之前，以便查询私密视频）
-    let mut sessdata = loop {
-        let input = prompt::ask_hidden_input("请输入 SESSDATA（Cookie 中的 SESSDATA）")?;
-        if input.trim().is_empty() {
-            println!("⚠ SESSDATA 不能为空，请重新输入");
-            continue;
-        }
-        break input;
-    };
-
-    let mut csrf = loop {
-        let input = prompt::ask_hidden_input("请输入 bili_jct（Cookie 中的 bili_jct / csrf）")?;
-        if input.trim().is_empty() {
-            println!("⚠ bili_jct 不能为空，请重新输入");
-            continue;
-        }
-        break input;
-    };
-
-    // 3. 询问 bvid（带重试循环）
-    let (bvid, page, cid, page_title) = loop {
-        let bvid = prompt::ask_input("请输入视频 bvid")?;
-        if bvid.trim().is_empty() {
-            println!("⚠ bvid 不能为空，请重新输入");
-            continue;
-        }
-        if !bvid.to_uppercase().starts_with("BV") {
-            println!("⚠ bvid 格式不正确（应以 BV 开头），请重新输入");
-            continue;
-        }
-
-        // 4. 询问分页号
-        let page = prompt::ask_number("请输入分页号")?;
-
-        // 5. 查询视频信息（带上 SESSDATA 以支持私密视频）
-        println!();
-        println!("正在查询视频信息...");
-        match api::get_cid_by_page(&bvid, page, &sessdata).await {
-            Ok((cid, title)) => {
-                println!("✓ 视频标题: {title}");
-                println!("✓ 分页 cid: {cid}");
-                break (bvid, page, cid, title);
-            }
-            Err(e) => {
-                println!("⚠ 查询失败: {e}");
-                let retry = prompt::ask_confirm("是否重新输入 bvid 和分页号？")?;
-                if !retry {
-                    return Err(AppError::Cancelled("取消创建".to_string()));
-                }
-            }
-        }
-    };
-
-    // 6. 询问目标弹幕池
-    let pool_str =
-        prompt::ask_input_with_default("请输入目标弹幕池（0:普通池 1:字幕池 2:特殊池）", "1")?;
-    let pool: u8 = pool_str.parse().unwrap_or(1);
-
-    // 7. 解析 XML
+    // 2. 优先解析 XML，避免账号/视频信息都确认后才暴露语法或数据问题
     println!();
     if rigor {
         println!("正在解析 XML 弹幕数据（严格校验模式）...");
     } else {
         println!("正在解析 XML 弹幕数据...");
     }
-    let parse_result = xml_parser::parse_danmaku_xml(&xml_content, rigor, time_offset_ms)?;
+    let parse_result =
+        xml_parser::parse_danmaku_xml(&xml_content, rigor, time_offset_ms, &remove_modes)?;
 
     println!("✓ 解析完成:");
     println!("  - 有效弹幕: {} 条", parse_result.tasks.len());
-    if parse_result.removed_mode8_count > 0 {
-        println!(
-            "  - 已剔除 mode=8 弹幕: {} 条（代码弹幕不可发送）",
-            parse_result.removed_mode8_count
-        );
-    }
-    if parse_result.removed_mode9_count > 0 {
-        println!(
-            "  - 已剔除 mode=9 弹幕: {} 条（BAS弹幕暂不支持）",
-            parse_result.removed_mode9_count
-        );
+    for (mode, count) in &parse_result.removed_modes {
+        println!("  - 已按规则剔除 mode={mode} 弹幕: {count} 条");
     }
     if parse_result.rigor_removed_count > 0 {
         println!(
@@ -119,11 +100,99 @@ pub async fn handle_create(
         );
     }
 
-    // 8. 检测 mode=7 高级弹幕权限
+    let interface_mode = create_inputs.is_some();
+
+    // 3. 获取 SESSDATA 和 bili_jct（接口模式不询问）
+    let (mut sessdata, mut csrf, video_input, pool_input) = if let Some(inputs) = create_inputs {
+        (
+            inputs.sessdata,
+            inputs.csrf,
+            Some(inputs.video),
+            Some(inputs.pool),
+        )
+    } else {
+        let sessdata = loop {
+            let input = prompt::ask_hidden_input("请输入 SESSDATA（Cookie 中的 SESSDATA）")?;
+            if input.trim().is_empty() {
+                println!("⚠ SESSDATA 不能为空，请重新输入");
+                continue;
+            }
+            break input;
+        };
+
+        let csrf = loop {
+            let input = prompt::ask_hidden_input("请输入 bili_jct（Cookie 中的 bili_jct / csrf）")?;
+            if input.trim().is_empty() {
+                println!("⚠ bili_jct 不能为空，请重新输入");
+                continue;
+            }
+            break input;
+        };
+
+        (sessdata, csrf, None, None)
+    };
+
+    // 4. 获取视频信息（接口模式缺项已在入口处报错）
+    let (bvid, page, cid, page_title) = match video_input {
+        Some(CreateVideoInput::BvidPage { bvid, page }) => {
+            println!();
+            println!("正在查询视频信息...");
+            let (cid, title) = api::get_cid_by_page(&bvid, page, &sessdata).await?;
+            println!("✓ 视频标题: {title}");
+            println!("✓ 分页 cid: {cid}");
+            (bvid, page, cid, title)
+        }
+        Some(CreateVideoInput::Cid(cid)) => {
+            println!("✓ 使用指定 cid: {cid}");
+            (String::new(), 0, cid, format!("CID {cid}"))
+        }
+        None => loop {
+            let bvid = prompt::ask_input("请输入视频 bvid")?;
+            if bvid.trim().is_empty() {
+                println!("⚠ bvid 不能为空，请重新输入");
+                continue;
+            }
+            if !bvid.to_uppercase().starts_with("BV") {
+                println!("⚠ bvid 格式不正确（应以 BV 开头），请重新输入");
+                continue;
+            }
+
+            let page = prompt::ask_number("请输入分页号")?;
+
+            println!();
+            println!("正在查询视频信息...");
+            match api::get_cid_by_page(&bvid, page, &sessdata).await {
+                Ok((cid, title)) => {
+                    println!("✓ 视频标题: {title}");
+                    println!("✓ 分页 cid: {cid}");
+                    break (bvid, page, cid, title);
+                }
+                Err(e) => {
+                    println!("⚠ 查询失败: {e}");
+                    let retry = prompt::ask_confirm("是否重新输入 bvid 和分页号？")?;
+                    if !retry {
+                        return Err(AppError::Cancelled("取消创建".to_string()));
+                    }
+                }
+            }
+        },
+    };
+
+    // 5. 获取目标弹幕池；接口模式缺项已在入口处报错
+    let pool: u8 = if let Some(pool) = pool_input {
+        println!("目标弹幕池: {pool}");
+        pool
+    } else {
+        let pool_str =
+            prompt::ask_input_with_default("请输入目标弹幕池（0:普通池 1:字幕池 2:特殊池）", "1")?;
+        pool_str.parse().unwrap_or(1)
+    };
+
+    // 6. 检测 mode=7 高级弹幕权限
     if parse_result.has_mode7 {
         println!();
-        if auto_mode {
-            println!("检测到 mode=7 高级弹幕（自动模式：跳过权限检查，继续创建）");
+        if auto_mode || interface_mode {
+            println!("检测到 mode=7 高级弹幕（自动/接口模式：跳过权限检查，继续创建）");
         } else {
             println!("检测到 mode=7 高级弹幕，正在检查发送权限...");
 
@@ -171,7 +240,7 @@ pub async fn handle_create(
         }
     }
 
-    // 9. 组装并保存
+    // 7. 组装并保存
     println!();
     let task_file = TaskFile::new(
         bvid.clone(),
@@ -184,12 +253,22 @@ pub async fn handle_create(
     );
 
     // 确定输出路径并保存（自动回退）
-    let output_path_str = save_task_file_robust(&task_file, output_path.as_deref(), &bvid, page)?;
+    let filename_video_id = if bvid.is_empty() {
+        format!("cid{cid}")
+    } else {
+        bvid.clone()
+    };
+    let output_path_str =
+        save_task_file_robust(&task_file, output_path.as_deref(), &filename_video_id, page)?;
     let output_path_display = std::path::PathBuf::from(&output_path_str);
 
     println!("═══════════════════════════════════════");
     println!("✓ 任务文件已创建: {}", output_path_display.display());
-    println!("  - 视频: {} (BV: {})", task_file.title, task_file.bvid);
+    if task_file.bvid.is_empty() {
+        println!("  - 视频: {} (CID: {})", task_file.title, task_file.cid);
+    } else {
+        println!("  - 视频: {} (BV: {})", task_file.title, task_file.bvid);
+    }
     println!("  - 分页: {page}, CID: {}", task_file.cid);
     println!("  - 弹幕数: {} 条", task_file.danmakus.len());
     println!("  - 弹幕池: {}", task_file.pool);
@@ -207,7 +286,11 @@ pub async fn handle_create(
 //  send 命令
 // ═══════════════════════════════════════════════════════════════
 
-pub async fn handle_send(task_path: String, auto_mode: bool) -> AppResult<()> {
+pub async fn handle_send(
+    task_path: String,
+    auto_mode: bool,
+    options: SendOptions,
+) -> AppResult<()> {
     if auto_mode {
         println!("═══════════════════════════════════════");
         println!("    DMsender_CLI — 发送弹幕（自动模式）");
@@ -222,22 +305,44 @@ pub async fn handle_send(task_path: String, auto_mode: bool) -> AppResult<()> {
     // 1. 加载任务文件
     let mut task_file = TaskFile::from_file(&task_path)?;
     println!("✓ 任务文件已加载: {task_path}");
-    println!("  - 视频: {} (BV: {})", task_file.title, task_file.bvid);
+    if task_file.bvid.is_empty() {
+        println!("  - 视频: {} (CID: {})", task_file.title, task_file.cid);
+    } else {
+        println!("  - 视频: {} (BV: {})", task_file.title, task_file.bvid);
+    }
     println!("  - 弹幕总数: {} 条", task_file.danmakus.len());
 
     // 2. 断点续传
-    if let Some(_last_id) = task_file.last_progress_id {
-        let pending = task_file.get_pending_danmakus().len();
-        let done = task_file.danmakus.len() - pending;
-        println!("  - 上次进度: 已完成 {done} 条，剩余 {pending} 条");
-        if auto_mode {
-            println!("  - 自动模式：从上次进度继续发送");
-        } else {
-            let resume = prompt::ask_confirm("是否从上次进度继续发送？")?;
-            if !resume {
-                task_file.last_progress_id = None;
-                task_file.to_file(&task_path)?;
-                println!("✓ 已重置进度，将从头开始发送");
+    match options.send_from.clone() {
+        Some(SendFrom::Last) => {
+            if let Some(_last_id) = task_file.last_progress_id {
+                let pending = task_file.get_pending_danmakus().len();
+                let done = task_file.danmakus.len() - pending;
+                println!("  - 指定从上次进度继续: 已完成 {done} 条，剩余 {pending} 条");
+            } else {
+                println!("  - 指定从上次进度继续，但任务文件没有历史进度，将从头发送");
+            }
+        }
+        Some(SendFrom::Id(start_id)) => {
+            task_file.last_progress_id = start_id.checked_sub(1);
+            task_file.to_file(&task_path)?;
+            println!("  - 指定从 ID={start_id} 开始发送");
+        }
+        None => {
+            if let Some(_last_id) = task_file.last_progress_id {
+                let pending = task_file.get_pending_danmakus().len();
+                let done = task_file.danmakus.len() - pending;
+                println!("  - 上次进度: 已完成 {done} 条，剩余 {pending} 条");
+                if auto_mode {
+                    println!("  - 自动模式：从上次进度继续发送");
+                } else {
+                    let resume = prompt::ask_confirm("是否从上次进度继续发送？")?;
+                    if !resume {
+                        task_file.last_progress_id = None;
+                        task_file.to_file(&task_path)?;
+                        println!("✓ 已重置进度，将从头开始发送");
+                    }
+                }
             }
         }
     }
@@ -260,12 +365,15 @@ pub async fn handle_send(task_path: String, auto_mode: bool) -> AppResult<()> {
     }
 
     // 4. 发送间隔
-    let interval_secs: u64 = if auto_mode {
+    let interval_ms: u64 = if let Some(ms) = options.interval_ms {
+        println!("发送间隔: {}", format_millis(ms));
+        ms
+    } else if auto_mode {
         println!("发送间隔: 10s（自动模式默认值）");
-        10
+        10_000
     } else {
         let interval_str = prompt::ask_input_with_default("请输入发送间隔（秒）", "10")?;
-        interval_str.parse().unwrap_or(10)
+        interval_str.parse::<u64>().unwrap_or(10) * 1000
     };
 
     // 5. 获取 WBI 密钥
@@ -285,7 +393,10 @@ pub async fn handle_send(task_path: String, auto_mode: bool) -> AppResult<()> {
 
     println!();
     println!("═══════════════════════════════════════");
-    println!("  开始发送弹幕（共 {total} 条，间隔 {interval_secs}s）");
+    println!(
+        "  开始发送弹幕（共 {total} 条，间隔 {}）",
+        format_millis(interval_ms)
+    );
     println!("  按 p 暂停 | 按 q 退出");
     println!("═══════════════════════════════════════");
     println!();
@@ -301,7 +412,9 @@ pub async fn handle_send(task_path: String, auto_mode: bool) -> AppResult<()> {
         &wbi_keys,
         &pending,
         total,
-        interval_secs,
+        interval_ms,
+        options.retry_interval_ms,
+        options.auto_retry.clone(),
         &mut keyboard_task,
         Arc::clone(&state),
         auto_mode,
@@ -320,7 +433,9 @@ async fn run_send_loop(
     wbi_keys: &WbiKeys,
     pending: &[DanmakuTask],
     total: usize,
-    interval_secs: u64,
+    interval_ms: u64,
+    retry_interval_ms: u64,
+    auto_retry: AutoRetry,
     keyboard_task: &mut Option<tokio::task::JoinHandle<()>>,
     state: Arc<tokio::sync::Mutex<(bool, bool)>>,
     auto_mode: bool,
@@ -375,7 +490,7 @@ async fn run_send_loop(
                 println!("✗ [{code}] {msg}");
                 fail_count += 1;
                 if auto_mode {
-                    println!("  自动模式：遇到致命错误，直接退出");
+                    println!("  自动模式：遇到致命错误");
                     print_summary(success_count, skip_count, fail_count);
                     return Ok(());
                 }
@@ -391,7 +506,7 @@ async fn run_send_loop(
             Err(SendError::ReAuth(msg)) => {
                 println!("⚠ {msg}");
                 if auto_mode {
-                    println!("  自动模式：需要重新认证，无法继续，退出");
+                    println!("  自动模式：需要重新认证");
                     fail_count += 1;
                     print_summary(success_count, skip_count, fail_count);
                     return Ok(());
@@ -422,10 +537,14 @@ async fn run_send_loop(
                 }
             }
             Err(SendError::Retry(code, msg)) => {
-                println!("[{code}] {msg}，进入重试流程（自动尝试5次）...");
+                println!(
+                    "[{code}] {msg}，进入重试流程（自动尝试{}）...",
+                    format_retry_frequency(&auto_retry)
+                );
                 let retry_result = retry_loop_with_pause(
                     &state,
-                    10,
+                    retry_interval_ms,
+                    auto_retry.clone(),
                     dm,
                     task_file,
                     task_path,
@@ -641,7 +760,8 @@ async fn run_send_loop(
                                                 println!("    [{code}] {msg}，进入重试流程...");
                                                 let retry_result = retry_loop_with_pause(
                                                     &state,
-                                                    10,
+                                                    retry_interval_ms,
+                                                    auto_retry.clone(),
                                                     &modified,
                                                     task_file,
                                                     task_path,
@@ -694,9 +814,9 @@ async fn run_send_loop(
         }
 
         // ── 等间隔（分段，便于响应按键） ──
-        if interval_secs > 0 {
+        if interval_ms > 0 {
             let mut elapsed = 0u64;
-            while elapsed < interval_secs * 2 {
+            while elapsed < interval_ms {
                 let (paused, should_exit) = *state.lock().await;
                 if should_exit {
                     print_summary(success_count, skip_count, fail_count);
@@ -711,8 +831,9 @@ async fn run_send_loop(
                     continue;
                 }
                 pause_notified = false;
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                elapsed += 1;
+                let chunk_ms = (interval_ms - elapsed).min(500);
+                tokio::time::sleep(tokio::time::Duration::from_millis(chunk_ms)).await;
+                elapsed += chunk_ms;
             }
         }
     }
@@ -730,7 +851,22 @@ fn print_summary(success: u64, skip: u64, fail: u64) {
     println!("  - 跳过: {skip} 条");
     println!("  - 失败: {fail} 条");
     println!("═══════════════════════════════════════");
-    force_exit(130);
+    force_exit(0);
+}
+
+fn format_millis(ms: u64) -> String {
+    if ms % 1000 == 0 {
+        format!("{}s", ms / 1000)
+    } else {
+        format!("{ms}ms")
+    }
+}
+
+fn format_retry_frequency(auto_retry: &AutoRetry) -> String {
+    match auto_retry {
+        AutoRetry::Finite(attempts) => format!("{attempts}次"),
+        AutoRetry::Infinite => "无限次".to_string(),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -809,12 +945,13 @@ async fn send_one_danmaku(
     }
 }
 
-/// 带暂停/退出响应的重试循环（5次一批）
-/// 目标要求：默认自动重试5次，若全部失败询问是否继续，选Y则再试5次，循环
-/// auto_mode: 5次全部失败直接跳过，不询问用户
+/// 带暂停/退出响应的重试循环
+/// 默认自动重试5次，若全部失败询问是否继续，选Y则再试5次，循环
+/// auto_mode: 有限次数全部失败后直接跳过，不询问用户
 async fn retry_loop_with_pause(
     state: &tokio::sync::Mutex<(bool, bool)>,
-    wait_secs: u64,
+    wait_ms: u64,
+    auto_retry: AutoRetry,
     dm: &DanmakuTask,
     task_file: &TaskFile,
     _task_path: &str,
@@ -823,11 +960,11 @@ async fn retry_loop_with_pause(
     state_clone: Arc<tokio::sync::Mutex<(bool, bool)>>,
     auto_mode: bool,
 ) -> RetryOutcome {
-    loop {
-        for attempt in 1..=5 {
-            // 等待并响应暂停/退出
+    if matches!(auto_retry, AutoRetry::Infinite) {
+        let mut attempt = 1u64;
+        loop {
             if attempt > 1 {
-                let result = wait_with_pause(state, wait_secs).await;
+                let result = wait_with_pause(state, wait_ms).await;
                 match result {
                     WaitResult::Timeout => {}
                     WaitResult::Exited => return RetryOutcome::Exited,
@@ -836,9 +973,38 @@ async fn retry_loop_with_pause(
                         ResumeResult::Exited => return RetryOutcome::Exited,
                     },
                 }
-                println!("    重试 {attempt}/5...");
             }
 
+            println!("    重试 {attempt}/inf...");
+            match send_one_danmaku(task_file, dm, wbi_keys).await {
+                Ok(_) => return RetryOutcome::Success,
+                Err(e) => println!("    ✗ {e}"),
+            }
+            attempt += 1;
+        }
+    }
+
+    let attempts = match auto_retry {
+        AutoRetry::Finite(attempts) => attempts,
+        AutoRetry::Infinite => unreachable!(),
+    };
+
+    loop {
+        for attempt in 1..=attempts {
+            // 等待并响应暂停/退出
+            if attempt > 1 {
+                let result = wait_with_pause(state, wait_ms).await;
+                match result {
+                    WaitResult::Timeout => {}
+                    WaitResult::Exited => return RetryOutcome::Exited,
+                    WaitResult::Paused => match wait_for_resume(state).await {
+                        ResumeResult::Resumed => {}
+                        ResumeResult::Exited => return RetryOutcome::Exited,
+                    },
+                }
+            }
+
+            println!("    重试 {attempt}/{attempts}...");
             match send_one_danmaku(task_file, dm, wbi_keys).await {
                 Ok(_) => return RetryOutcome::Success,
                 Err(e) => {
@@ -847,8 +1013,7 @@ async fn retry_loop_with_pause(
             }
         }
 
-        // 5次全部失败
-        println!("  ⚠ 5次重试均失败");
+        println!("  ⚠ {attempts}次重试均失败");
         if auto_mode {
             println!("  自动模式：直接跳过此条");
             return RetryOutcome::Skipped;
@@ -877,9 +1042,9 @@ enum ResumeResult {
 }
 
 /// 分段等待，可响应暂停/退出
-async fn wait_with_pause(state: &tokio::sync::Mutex<(bool, bool)>, secs: u64) -> WaitResult {
+async fn wait_with_pause(state: &tokio::sync::Mutex<(bool, bool)>, ms: u64) -> WaitResult {
     let mut elapsed = 0u64;
-    while elapsed < secs * 2 {
+    while elapsed < ms {
         let (paused, should_exit) = *state.lock().await;
         if should_exit {
             return WaitResult::Exited;
@@ -887,8 +1052,9 @@ async fn wait_with_pause(state: &tokio::sync::Mutex<(bool, bool)>, secs: u64) ->
         if paused {
             return WaitResult::Paused;
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        elapsed += 1;
+        let chunk_ms = (ms - elapsed).min(500);
+        tokio::time::sleep(tokio::time::Duration::from_millis(chunk_ms)).await;
+        elapsed += chunk_ms;
     }
     WaitResult::Timeout
 }

@@ -218,11 +218,10 @@ pub async fn post_danmaku(
         + "000000";
 
     // 构建参数列表（用于 WBI 签名）
-    let params_for_sign: Vec<(&str, String)> = vec![
+    let mut params_for_sign: Vec<(&str, String)> = vec![
         ("type", "1".to_string()),
         ("oid", cid.to_string()),
         ("msg", msg.to_string()),
-        ("bvid", bvid.to_string()),
         ("progress", progress.to_string()),
         ("color", color.to_string()),
         ("fontsize", fontsize.to_string()),
@@ -231,6 +230,9 @@ pub async fn post_danmaku(
         ("rnd", rnd.clone()),
         ("csrf", csrf.to_string()),
     ];
+    if !bvid.is_empty() {
+        params_for_sign.push(("bvid", bvid.to_string()));
+    }
 
     let (w_rid, wts) = sign_params(&params_for_sign, &wbi_keys.mixin_key);
 
@@ -238,24 +240,14 @@ pub async fn post_danmaku(
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         .build()?;
 
+    let mut form = params_for_sign;
+    form.push(("w_rid", w_rid));
+    form.push(("wts", wts));
+
     let resp = client
         .post(url)
         .header("Cookie", format!("SESSDATA={sessdata}"))
-        .form(&[
-            ("type", "1"),
-            ("oid", &cid.to_string()),
-            ("msg", msg),
-            ("bvid", bvid),
-            ("progress", &progress.to_string()),
-            ("color", &color.to_string()),
-            ("fontsize", &fontsize.to_string()),
-            ("pool", &pool.to_string()),
-            ("mode", &mode.to_string()),
-            ("rnd", &rnd),
-            ("csrf", csrf),
-            ("w_rid", &w_rid),
-            ("wts", &wts),
-        ])
+        .form(&form)
         .send()
         .await?;
 

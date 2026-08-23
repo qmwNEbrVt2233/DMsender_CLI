@@ -12,11 +12,11 @@ DMsender_CLI是一个用于发送bilibili弹幕的命令行工具
 # create 命令例：
 .\DMsender.exe create "D:\sample.xml"
 ```
-2. SESSDATA与bili_jct隐藏输入且没有退格删除，复制粘贴后回车
-3. 输入视频信息，bv号与目标分p
-4. 解析验证xml，若启用严格校验则剔除非法数据
+2. 解析验证xml，若启用严格校验则剔除非法数据
+3. SESSDATA与bili_jct隐藏输入且无法退格删除，请复制粘贴后回车
+4. 输入视频信息，bv号与目标分p
 5. 若有m7弹幕则查询是否有发送权限，若没有，可选择是否继续创建
-6. 若指定输出路径则输出至指定路径，否则默认输出至可执行程序同目录下的`tasks`目录下，若没有指定文件名，则使用默认文件名格式，仅将以`/`或`\`结尾的指定路径视为目录，如：`-o "D:\tasks\"`若目录不存在或写入失败，则输出至默认路径
+6. 若指定输出路径则输出至指定路径，否则默认输出至可执行程序同目录下的`tasks`目录下，若没有指定文件名，则使用默认文件名格式，仅将以`/`或`\`结尾的指定路径视为目录，如：`-o "D:\tasks\"`。若目录不存在或写入失败，则输出至默认路径
 
 ## 发送流程
 1. 使用`send`命令选择任务文件进行发送
@@ -46,12 +46,12 @@ DMsender_CLI是一个用于发送bilibili弹幕的命令行工具
 
 # 功能
 
-## 根命令SubCommands:
+## 根命令:
 - create  根据 XML 创建任务文件 用法: DMsender create "XMLFILEURL"
 - send    选择任务文件发起网络请求发送弹幕 用法: DMsender send "TASKFILEURL"
 - help    获取帮助
 
-## 选项Options:
+## 选项:
 - -h, --help     Print help
 - -V, --version  Print version
 
@@ -67,15 +67,23 @@ DMsender_CLI是一个用于发送bilibili弹幕的命令行工具
 | --- | --- | --- |
 | --rigor                    | 启用严格校验模式，过滤非法数据 | -r |
 | --output <OUTPUT>          | 指定任务文件的输出路径 | -o |
-| --sendafter                | 创建完成后直接启动发送流程 |   |
 | --timeoffset <TIMEOFFSET>  | 对转换后的 progress 进行偏移（单位 ms，支持 +/-） |   |
-| --auto                     | 自动模式：所有需要用户选择的地方自动跳过 （仅在同时指定 --sendafter 时有效） |   |
+| --sessdata <SESSDATA>      | 接口模式账号信息 |   |
+| --bili_jct <BILI_JCT>      | 接口模式账号 csrf |   |
+| --bvid <BVID>              | 接口模式视频 bvid |   |
+| --page <PAGE>              | 接口模式视频分页号 |   |
+| --cid <CID>                | 接口模式直接指定 cid，可替代 --bvid + --page |   |
+| --pool <POOL>              | 接口模式目标弹幕池，0:普通池 1:字幕池 2:特殊池 |   |
+| --remove[=<RULE>]          | 指定移除项，例如 `--remove="mode=1,4,5,6,8,9"`；不指定此标识时默认移除 mode=8,9；仅写 `--remove` 时不移除任何项 |   |
+| --sendafter                | 创建完成后直接启动发送流程 |   |
+| --auto                     | 自动模式：所有需要选择的地方自动跳过 （在同时指定 --sendafter 时有效） |   |
+| --interval <MS>            | 指定发送间隔（毫秒）（需同时指定 --sendafter） |   |
+| --sendfrom <last\|ID>      | 指定从上次进度或指定 ID 开始发送 （需同时指定 --sendafter） |   |
+| --retryinterval <MS>       | 指定重试间隔（毫秒）（需同时指定 --sendafter） |   |
+| --autoretryfrequency <N\|inf> | 指定自动重试次数，或 `inf` 无限重试 （需同时指定 --sendafter） |   |
 | --help                     | Print help | -h |
 
-### 集大成者
-```bash
-.\DMsender.exe create "D:\sample.xml" -r --sendafter --auto --timeoffset=-10000 -o "C:\Users\username\Downloads\"
-```
+配置了 `--sessdata`、`--bili_jct`、`--bvid`、`--page`、`--cid`、`--pool` 中任一接口参数时，账号信息与发送目标必须为在命令中指定，视频信息必须使用 `--bvid + --page` 或 `--cid` 二选一指定，缺项直接报错退出，不进入询问流程
 
 ## send命令
 **Usage**: 
@@ -87,6 +95,10 @@ DMsender_CLI是一个用于发送bilibili弹幕的命令行工具
 **Options**:
 - --auto  自动模式：
   - 错误类型处理：Retry 默认重试5次后跳过，Fatal/ReAuth 直接退出，Modify 直接跳过
+- --interval <MS>  指定发送间隔（毫秒）
+- --sendfrom <last|ID>  指定从上次发送进度继续，或从指定 ID 开始发送
+- --retryinterval <MS>  指定重试间隔（毫秒）
+- --autoretryfrequency <N|inf>  指定自动重试次数，或 `inf` 无限重试
 - -h, --help  Print help
 
 # 项目文件结构
