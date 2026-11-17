@@ -1,8 +1,12 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
+use super::api::{http_client, parse_json_response};
 use crate::errors::{AppError, AppResult};
+
+/// WBI 密钥刷新阈值（6 小时）
+const WBI_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// WBI 重排映射表
 const MIXIN_KEY_ENC_TAB: [usize; 64] = [
@@ -19,14 +23,14 @@ pub struct WbiKeys {
     pub sub_key: String,
     /// 计算后的 mixin_key
     pub mixin_key: String,
+    /// 获取密钥的时间点，用于长任务定期刷新
+    pub fetched_at: Instant,
 }
 
 impl WbiKeys {
     /// 从 nav 接口获取 WBI 密钥
     pub async fn fetch() -> AppResult<Self> {
-        let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-            .build()?;
+        let client = http_client()?;
 
         #[derive(Deserialize)]
         struct NavResponse {
@@ -49,7 +53,7 @@ impl WbiKeys {
             .send()
             .await?;
 
-        let body: NavResponse = resp.json().await?;
+        let body: NavResponse = parse_json_response(resp).await?;
 
         let wbi_img = body
             .data
@@ -59,34 +63,50 @@ impl WbiKeys {
         let img_key = extract_key_from_url(&wbi_img.img_url)?;
         let sub_key = extract_key_from_url(&wbi_img.sub_url)?;
         let raw = img_key.clone() + &sub_key;
-        let mixin_key = get_mixin_key(raw.as_bytes());
+        let mixin_key = get_mixin_key(raw.as_bytes())?;
 
         Ok(WbiKeys {
             img_key,
             sub_key,
             mixin_key,
+            fetched_at: Instant::now(),
         })
+    }
+
+    /// 检查密钥是否已超过刷新周期
+    pub fn is_stale(&self) -> bool {
+        self.fetched_at.elapsed() >= WBI_REFRESH_INTERVAL
     }
 }
 
 /// 从 WBI 图片 URL 中提取文件名（即 key）
 fn extract_key_from_url(url: &str) -> AppResult<String> {
     // URL 格式: https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png
-    let filename = url
+    let trimmed = url.trim();
+    let filename = trimmed
         .rsplit('/')
         .next()
         .and_then(|s| s.split('.').next())
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::Business(format!("无法解析 WBI URL: {url}")))?;
     Ok(filename.to_string())
 }
 
 /// 对 img_key + sub_key 进行字符顺序打乱编码，取前 32 位
-fn get_mixin_key(orig: &[u8]) -> String {
-    MIXIN_KEY_ENC_TAB
+fn get_mixin_key(orig: &[u8]) -> AppResult<String> {
+    if orig.len() < MIXIN_KEY_ENC_TAB.len() {
+        return Err(AppError::Business(format!(
+            "WBI 原始密钥长度不足（期望至少 {} 字节，实际 {} 字节）",
+            MIXIN_KEY_ENC_TAB.len(),
+            orig.len()
+        )));
+    }
+    let key = MIXIN_KEY_ENC_TAB
         .iter()
         .take(32)
-        .map(|&i| orig.get(i).copied().unwrap_or(b'\0') as char)
-        .collect::<String>()
+        .map(|&i| orig[i] as char)
+        .collect::<String>();
+    Ok(key)
 }
 
 /// URL 编码（按 WBI 规范：大写十六进制，空格编码为 %20）
@@ -151,8 +171,13 @@ mod tests {
         let img_key = "7cd084941338484aae1ad9425b84077c";
         let sub_key = "4932caff0ff746eab6f01bf08b70ac45";
         let raw = img_key.to_string() + sub_key;
-        let mixin = get_mixin_key(raw.as_bytes());
+        let mixin = get_mixin_key(raw.as_bytes()).unwrap();
         assert_eq!(mixin, "ea1db124af3c7062474693fa704f4ff8");
+    }
+
+    #[test]
+    fn test_get_mixin_key_rejects_short_input() {
+        assert!(get_mixin_key(b"too_short").is_err());
     }
 
     #[test]
@@ -160,6 +185,13 @@ mod tests {
         let url = "https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png";
         let key = extract_key_from_url(url).unwrap();
         assert_eq!(key, "7cd084941338484aae1ad9425b84077c");
+    }
+
+    #[test]
+    fn test_extract_key_from_empty_or_invalid_url_fails() {
+        assert!(extract_key_from_url("").is_err());
+        assert!(extract_key_from_url("https://i0.hdslb.com/bfs/wbi/.png").is_err());
+        assert!(extract_key_from_url("https://i0.hdslb.com/bfs/wbi/").is_err());
     }
 
     #[test]

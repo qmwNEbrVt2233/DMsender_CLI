@@ -25,7 +25,7 @@ pub enum Command {
         #[arg(long = "sendafter")]
         sendafter: bool,
         /// 对转换后的 progress 进行偏移（单位 ms，支持 +/-）
-        #[arg(long = "timeoffset")]
+        #[arg(long = "timeoffset", allow_hyphen_values = true)]
         timeoffset: Option<String>,
         /// 自动模式：所有需要用户选择的地方自动跳过
         /// （仅在同时指定 --sendafter 时有效）

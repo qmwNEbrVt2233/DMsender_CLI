@@ -1,5 +1,9 @@
-use std::process;
+use std::io::IsTerminal;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use crate::core::api::{self, AdvPermissionResult};
 use crate::core::task::{DanmakuTask, TaskFile};
@@ -54,6 +58,12 @@ impl Default for SendOptions {
     }
 }
 
+/// 键盘监听句柄，通过原子标志位优雅退出，避免强行 abort 阻塞读取抢占后续交互输入
+struct KeyboardListener {
+    stop_flag: Arc<AtomicBool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  create 命令
 // ═══════════════════════════════════════════════════════════════
@@ -95,7 +105,7 @@ pub async fn handle_create(
     }
     if parse_result.rigor_removed_count > 0 {
         println!(
-            "  - 严格校验剔除: {} 条（ color/size 不合法）",
+            "  - 严格校验剔除: {} 条（字段或内容不合法）",
             parse_result.rigor_removed_count
         );
     }
@@ -111,24 +121,10 @@ pub async fn handle_create(
             Some(inputs.pool),
         )
     } else {
-        let sessdata = loop {
-            let input = prompt::ask_hidden_input("请输入 SESSDATA（Cookie 中的 SESSDATA）")?;
-            if input.trim().is_empty() {
-                println!("⚠ SESSDATA 不能为空，请重新输入");
-                continue;
-            }
-            break input;
-        };
-
-        let csrf = loop {
-            let input = prompt::ask_hidden_input("请输入 bili_jct（Cookie 中的 bili_jct / csrf）")?;
-            if input.trim().is_empty() {
-                println!("⚠ bili_jct 不能为空，请重新输入");
-                continue;
-            }
-            break input;
-        };
-
+        let sessdata =
+            prompt_non_empty_hidden("请输入 SESSDATA（Cookie 中的 SESSDATA）", "SESSDATA")?;
+        let csrf =
+            prompt_non_empty_hidden("请输入 bili_jct（Cookie 中的 bili_jct / csrf）", "bili_jct")?;
         (sessdata, csrf, None, None)
     };
 
@@ -152,12 +148,19 @@ pub async fn handle_create(
                 println!("⚠ bvid 不能为空，请重新输入");
                 continue;
             }
-            if !bvid.to_uppercase().starts_with("BV") {
-                println!("⚠ bvid 格式不正确（应以 BV 开头），请重新输入");
+            if !bvid.to_uppercase().starts_with("BV")
+                || bvid.len() < 3
+                || !bvid.chars().all(|c| c.is_ascii_alphanumeric())
+            {
+                println!("⚠ bvid 格式不正确（应以 BV 开头且仅包含字母和数字），请重新输入");
                 continue;
             }
 
             let page = prompt::ask_number("请输入分页号")?;
+            if page == 0 {
+                println!("⚠ 分页号必须大于 0，请重新输入");
+                continue;
+            }
 
             println!();
             println!("正在查询视频信息...");
@@ -183,9 +186,16 @@ pub async fn handle_create(
         println!("目标弹幕池: {pool}");
         pool
     } else {
-        let pool_str =
-            prompt::ask_input_with_default("请输入目标弹幕池（0:普通池 1:字幕池 2:特殊池）", "1")?;
-        pool_str.parse().unwrap_or(1)
+        loop {
+            let pool_str = prompt::ask_input_with_default(
+                "请输入目标弹幕池（0:普通池 1:字幕池 2:特殊池）",
+                "1",
+            )?;
+            match pool_str.parse::<u8>() {
+                Ok(p) if p <= 2 => break p,
+                _ => println!("⚠ 弹幕池必须为 0、1 或 2，请重新输入"),
+            }
+        }
     };
 
     // 6. 检测 mode=7 高级弹幕权限
@@ -198,6 +208,7 @@ pub async fn handle_create(
 
             let mut sessdata_for_check = sessdata.clone();
             let mut csrf_for_check = csrf.clone();
+            let mut credentials_updated = false;
 
             loop {
                 match api::check_advanced_permission(&sessdata_for_check, cid).await {
@@ -216,10 +227,16 @@ pub async fn handle_create(
                         break;
                     }
                     AdvPermissionResult::NeedReAuth => {
-                        println!("⚠ 账号未登录或凭据过期/格式无效 (code=-101/-400)");
-                        sessdata_for_check = prompt::ask_hidden_input("请重新输入 SESSDATA")?;
-                        csrf_for_check = prompt::ask_hidden_input("请重新输入 bili_jct")?;
-                        // 更新主变量，使后续任务文件使用新凭据
+                        println!("⚠ 账号未登录或凭据过期/格式无效");
+                        if !prompt::ask_confirm("是否重新输入凭据并重试权限检查？")?
+                        {
+                            return Err(AppError::Cancelled("取消创建".to_string()));
+                        }
+                        sessdata_for_check =
+                            prompt_non_empty_hidden("请重新输入 SESSDATA", "SESSDATA")?;
+                        csrf_for_check =
+                            prompt_non_empty_hidden("请重新输入 bili_jct", "bili_jct")?;
+                        credentials_updated = true;
                     }
                     AdvPermissionResult::Error(msg) => {
                         println!("⚠ 检查权限时出错: {msg}");
@@ -232,8 +249,7 @@ pub async fn handle_create(
                 }
             }
 
-            // 如果重新输入了凭据，更新后续使用的值
-            if sessdata_for_check != sessdata {
+            if credentials_updated {
                 sessdata = sessdata_for_check;
                 csrf = csrf_for_check;
             }
@@ -302,8 +318,14 @@ pub async fn handle_send(
     }
     println!();
 
-    // 1. 加载任务文件
+    // 1. 加载并校验任务文件基础字段
     let mut task_file = TaskFile::from_file(&task_path)?;
+    if task_file.pool > 2 {
+        return Err(AppError::Business(format!(
+            "任务文件弹幕池配置无效: pool={}（必须为 0、1 或 2）",
+            task_file.pool
+        )));
+    }
     println!("✓ 任务文件已加载: {task_path}");
     if task_file.bvid.is_empty() {
         println!("  - 视频: {} (CID: {})", task_file.title, task_file.cid);
@@ -312,26 +334,44 @@ pub async fn handle_send(
     }
     println!("  - 弹幕总数: {} 条", task_file.danmakus.len());
 
-    // 2. 断点续传
+    if task_file.sessdata.trim().is_empty() || task_file.csrf.trim().is_empty() {
+        if auto_mode {
+            return Err(AppError::Business(
+                "任务文件缺少有效的 SESSDATA 或 bili_jct 凭据".to_string(),
+            ));
+        }
+        println!("⚠ 任务文件缺少有效的 SESSDATA 或 bili_jct 凭据，请补充");
+        let new_sessdata = prompt_non_empty_hidden("请输入 SESSDATA", "SESSDATA")?;
+        let new_csrf = prompt_non_empty_hidden("请输入 bili_jct", "bili_jct")?;
+        task_file.update_credentials(&task_path, new_sessdata, new_csrf)?;
+    }
+
+    // 2. 断点续传（先在内存中计算，避免提前破坏磁盘上的历史进度）
     match options.send_from.clone() {
         Some(SendFrom::Last) => {
             if let Some(_last_id) = task_file.last_progress_id {
                 let pending = task_file.get_pending_danmakus().len();
-                let done = task_file.danmakus.len() - pending;
+                let done = task_file.danmakus.len().saturating_sub(pending);
                 println!("  - 指定从上次进度继续: 已完成 {done} 条，剩余 {pending} 条");
             } else {
                 println!("  - 指定从上次进度继续，但任务文件没有历史进度，将从头发送");
             }
         }
         Some(SendFrom::Id(start_id)) => {
+            let previous_progress = task_file.last_progress_id;
             task_file.last_progress_id = start_id.checked_sub(1);
-            task_file.to_file(&task_path)?;
-            println!("  - 指定从 ID={start_id} 开始发送");
+            let pending_count = task_file.get_pending_danmakus().len();
+            if pending_count == 0 && !task_file.danmakus.is_empty() {
+                task_file.last_progress_id = previous_progress;
+                println!("⚠ 指定的起始 ID={start_id} 大于任务文件中的最大弹幕 ID，未更改任务进度");
+                return Ok(());
+            }
+            println!("  - 指定从 ID={start_id} 开始发送（剩余 {pending_count} 条）");
         }
         None => {
             if let Some(_last_id) = task_file.last_progress_id {
                 let pending = task_file.get_pending_danmakus().len();
-                let done = task_file.danmakus.len() - pending;
+                let done = task_file.danmakus.len().saturating_sub(pending);
                 println!("  - 上次进度: 已完成 {done} 条，剩余 {pending} 条");
                 if auto_mode {
                     println!("  - 自动模式：从上次进度继续发送");
@@ -356,8 +396,8 @@ pub async fn handle_send(
         } else {
             let update = prompt::ask_confirm("是否更新 SESSDATA 和 bili_jct？")?;
             if update {
-                let new_sessdata = prompt::ask_hidden_input("请输入新的 SESSDATA")?;
-                let new_csrf = prompt::ask_hidden_input("请输入新的 bili_jct")?;
+                let new_sessdata = prompt_non_empty_hidden("请输入新的 SESSDATA", "SESSDATA")?;
+                let new_csrf = prompt_non_empty_hidden("请输入新的 bili_jct", "bili_jct")?;
                 task_file.update_credentials(&task_path, new_sessdata, new_csrf)?;
                 println!("✓ 凭据已更新");
             }
@@ -372,14 +412,23 @@ pub async fn handle_send(
         println!("发送间隔: 10s（自动模式默认值）");
         10_000
     } else {
-        let interval_str = prompt::ask_input_with_default("请输入发送间隔（秒）", "10")?;
-        interval_str.parse::<u64>().unwrap_or(10) * 1000
+        loop {
+            let interval_str = prompt::ask_input_with_default("请输入发送间隔（秒）", "10")?;
+            match interval_str
+                .parse::<u64>()
+                .ok()
+                .and_then(|s| s.checked_mul(1000))
+            {
+                Some(ms) => break ms,
+                None => println!("⚠ 请输入有效的非负整数秒数（且不能溢出）"),
+            }
+        }
     };
 
     // 5. 获取 WBI 密钥
     println!();
     println!("正在获取 WBI 签名密钥...");
-    let wbi_keys = WbiKeys::fetch().await?;
+    let mut wbi_keys = WbiKeys::fetch().await?;
     println!("✓ WBI 密钥已就绪");
 
     // 6. 准备待发送列表
@@ -403,13 +452,13 @@ pub async fn handle_send(
 
     // 共享状态: (paused, should_exit)
     let state = Arc::new(tokio::sync::Mutex::new((false, false)));
-    let mut keyboard_task = Some(spawn_keyboard_listener(Arc::clone(&state)));
+    let mut keyboard_task = spawn_keyboard_listener(Arc::clone(&state));
 
     // 将主发送逻辑放在独立函数中，确保键盘监听器总是在这里被清理
     let result = run_send_loop(
         &task_path,
         &mut task_file,
-        &wbi_keys,
+        &mut wbi_keys,
         &pending,
         total,
         interval_ms,
@@ -426,17 +475,25 @@ pub async fn handle_send(
     result
 }
 
+enum DanmakuOutcome {
+    Sent,
+    Skipped,
+    Failed,
+    Exit { failed: bool },
+}
+
 /// 主发送循环（从 handle_send 中提取，以便外层统一清理键盘监听器）
+#[allow(clippy::too_many_arguments)]
 async fn run_send_loop(
     task_path: &str,
     task_file: &mut TaskFile,
-    wbi_keys: &WbiKeys,
+    wbi_keys: &mut WbiKeys,
     pending: &[DanmakuTask],
     total: usize,
     interval_ms: u64,
     retry_interval_ms: u64,
     auto_retry: AutoRetry,
-    keyboard_task: &mut Option<tokio::task::JoinHandle<()>>,
+    keyboard_task: &mut Option<KeyboardListener>,
     state: Arc<tokio::sync::Mutex<(bool, bool)>>,
     auto_mode: bool,
 ) -> AppResult<()> {
@@ -445,12 +502,13 @@ async fn run_send_loop(
     let mut fail_count = 0u64;
     let mut pause_notified = false;
 
-    for dm in pending {
+    for (pos, dm) in pending.iter().enumerate() {
         // ── 等待直到不暂停 ──
         loop {
             let (paused, should_exit) = *state.lock().await;
             if should_exit {
-                break;
+                print_summary(success_count, skip_count, fail_count);
+                return Ok(());
             }
             if !paused {
                 break;
@@ -460,19 +518,26 @@ async fn run_send_loop(
                 println!("⏸  暂停执行完成，是否继续？(按 c 继续 / 按 q 退出)");
                 pause_notified = true;
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        }
-        let (_paused, should_exit) = *state.lock().await;
-        if should_exit {
-            print_summary(success_count, skip_count, fail_count);
-            return Ok(());
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
         pause_notified = false;
+
+        // 长任务跨时段时自动刷新 WBI 密钥
+        if wbi_keys.is_stale() {
+            match WbiKeys::fetch().await {
+                Ok(fresh) => {
+                    *wbi_keys = fresh;
+                }
+                Err(e) => {
+                    println!("⚠ 刷新 WBI 密钥失败（继续使用旧密钥）: {e}");
+                }
+            }
+        }
 
         // ── 发送弹幕 ──
         let idx = success_count + skip_count + fail_count + 1;
         print!("[{idx}/{total}] ID={} mode={} | ", dm.id, dm.mode);
-        let msg_preview: String = if dm.msg.len() > 30 {
+        let msg_preview: String = if dm.msg.chars().count() > 30 {
             dm.msg.chars().take(30).collect::<String>() + "..."
         } else {
             dm.msg.clone()
@@ -480,341 +545,54 @@ async fn run_send_loop(
         print!("\"{msg_preview}\"");
         let _ = std::io::Write::flush(&mut std::io::stdout());
 
-        match send_one_danmaku(task_file, dm, wbi_keys).await {
-            Ok(_) => {
-                println!("✓ 成功");
-                success_count += 1;
-                task_file.update_progress(task_path, dm.id)?;
-            }
-            Err(SendError::Fatal(code, msg)) => {
-                println!("✗ [{code}] {msg}");
-                fail_count += 1;
-                if auto_mode {
-                    println!("  自动模式：遇到致命错误");
-                    print_summary(success_count, skip_count, fail_count);
-                    return Ok(());
-                }
-                let exit = prompt_with_keyboard_paused(keyboard_task, Arc::clone(&state), || {
-                    prompt::ask_confirm_default_no("是否退出发送程序？")
-                })
-                .await?;
-                if exit {
-                    print_summary(success_count, skip_count, fail_count);
-                    return Ok(());
-                }
-            }
-            Err(SendError::ReAuth(msg)) => {
-                println!("⚠ {msg}");
-                if auto_mode {
-                    println!("  自动模式：需要重新认证");
-                    fail_count += 1;
-                    print_summary(success_count, skip_count, fail_count);
-                    return Ok(());
-                }
-                let new_sessdata =
-                    prompt_with_keyboard_paused(keyboard_task, Arc::clone(&state), || {
-                        prompt::ask_hidden_input("请输入新的 SESSDATA")
-                    })
-                    .await?;
-                let new_csrf =
-                    prompt_with_keyboard_paused(keyboard_task, Arc::clone(&state), || {
-                        prompt::ask_hidden_input("请输入新的 bili_jct")
-                    })
-                    .await?;
-                task_file.update_credentials(task_path, new_sessdata, new_csrf)?;
-                println!("✓ 凭据已更新，重试当前弹幕...");
+        let initial_result = send_one_danmaku(task_file, dm, wbi_keys).await;
 
-                match send_one_danmaku(task_file, dm, wbi_keys).await {
-                    Ok(_) => {
-                        println!("  ✓ 重试成功");
-                        success_count += 1;
-                        task_file.update_progress(task_path, dm.id)?;
-                    }
-                    Err(e2) => {
-                        println!("  ✗ 重试失败: {e2}");
-                        fail_count += 1;
-                    }
-                }
-            }
-            Err(SendError::Retry(code, msg)) => {
-                println!(
-                    "[{code}] {msg}，进入重试流程（自动尝试{}）...",
-                    format_retry_frequency(&auto_retry)
-                );
-                let retry_result = retry_loop_with_pause(
-                    &state,
-                    retry_interval_ms,
-                    auto_retry.clone(),
-                    dm,
-                    task_file,
-                    task_path,
-                    wbi_keys,
-                    keyboard_task,
-                    Arc::clone(&state),
-                    auto_mode,
-                )
-                .await;
-                match retry_result {
-                    RetryOutcome::Success => {
-                        println!("  ✓ 重试成功");
-                        success_count += 1;
-                        task_file.update_progress(task_path, dm.id)?;
-                    }
-                    RetryOutcome::Skipped => {
-                        println!("  ⏭ 已跳过");
-                        skip_count += 1;
-                        task_file.update_progress(task_path, dm.id)?;
-                    }
-                    RetryOutcome::Exited => {
-                        print_summary(success_count, skip_count, fail_count);
-                        return Ok(());
-                    }
-                }
-            }
-            Err(SendError::Modify(code, msg)) => {
-                println!("[{code}] {msg}");
-                if auto_mode {
-                    println!("  自动模式：直接跳过此条弹幕");
-                    skip_count += 1;
+        // 若在请求期间按下了 q，优先退出而不再弹出交互提示
+        if state.lock().await.1 {
+            match initial_result {
+                Ok(_) => {
+                    println!("✓ 成功");
+                    success_count += 1;
                     task_file.update_progress(task_path, dm.id)?;
-                    // 继续下一条弹幕
-                } else {
-                    // 打印失败任务元数据
-                    let meta =
-                        serde_json::to_string_pretty(dm).unwrap_or_else(|_| format!("{dm:?}"));
-                    println!("  失败弹幕数据:");
-                    println!("{meta}");
+                }
+                Err(e) => {
+                    println!("✗ {e}");
+                    fail_count += 1;
+                }
+            }
+            print_summary(success_count, skip_count, fail_count);
+            return Ok(());
+        }
 
-                    // 修改循环：支持反复修改 → 重试 → 重新分类错误
-                    'modify_loop: loop {
-                        let choice =
-                            prompt_with_keyboard_paused(keyboard_task, Arc::clone(&state), || {
-                                prompt::ask_modify_choice()
-                            })
-                            .await?;
-                        match choice {
-                            ModifyChoice::Skip => {
-                                println!("  ⏭ 已跳过");
-                                skip_count += 1;
-                                task_file.update_progress(task_path, dm.id)?;
-                                break 'modify_loop;
-                            }
-                            ModifyChoice::Exit => {
-                                print_summary(success_count, skip_count, fail_count);
-                                return Ok(());
-                            }
-                            ModifyChoice::Modify => {
-                                // 收集修改后的参数
-                                let new_mode = prompt_with_keyboard_paused(
-                                    keyboard_task,
-                                    Arc::clone(&state),
-                                    || prompt::ask_input_with_default("mode", &dm.mode.to_string()),
-                                )
-                                .await?
-                                .parse()
-                                .unwrap_or(dm.mode);
-                                let new_msg = prompt_with_keyboard_paused(
-                                    keyboard_task,
-                                    Arc::clone(&state),
-                                    || prompt::ask_input_with_default("msg", &dm.msg),
-                                )
-                                .await?;
-                                let new_progress = prompt_with_keyboard_paused(
-                                    keyboard_task,
-                                    Arc::clone(&state),
-                                    || {
-                                        prompt::ask_input_with_default(
-                                            "progress/ms",
-                                            &dm.progress.to_string(),
-                                        )
-                                    },
-                                )
-                                .await?
-                                .parse()
-                                .unwrap_or(dm.progress);
-                                let new_color = prompt_with_keyboard_paused(
-                                    keyboard_task,
-                                    Arc::clone(&state),
-                                    || {
-                                        prompt::ask_input_with_default(
-                                            "color",
-                                            &dm.color.to_string(),
-                                        )
-                                    },
-                                )
-                                .await?
-                                .parse()
-                                .unwrap_or(dm.color);
-                                let new_fontsize = prompt_with_keyboard_paused(
-                                    keyboard_task,
-                                    Arc::clone(&state),
-                                    || {
-                                        prompt::ask_input_with_default(
-                                            "fontsize",
-                                            &dm.fontsize.to_string(),
-                                        )
-                                    },
-                                )
-                                .await?
-                                .parse()
-                                .unwrap_or(dm.fontsize);
+        let outcome = handle_danmaku_result(
+            initial_result,
+            dm,
+            task_path,
+            task_file,
+            wbi_keys,
+            retry_interval_ms,
+            &auto_retry,
+            keyboard_task,
+            &state,
+            auto_mode,
+        )
+        .await?;
 
-                                let modified = DanmakuTask {
-                                    id: dm.id,
-                                    mode: new_mode,
-                                    msg: new_msg,
-                                    progress: new_progress,
-                                    color: new_color,
-                                    fontsize: new_fontsize,
-                                };
-
-                                // 发送修改后的弹幕，并对返回的错误重新分类处理
-                                match send_one_danmaku(task_file, &modified, wbi_keys).await {
-                                    Ok(_) => {
-                                        println!("  ✓ 修改后发送成功");
-                                        // 将修改后的数据写回任务文件
-                                        task_file.replace_danmaku(task_path, &modified)?;
-                                        success_count += 1;
-                                        task_file.update_progress(task_path, dm.id)?;
-                                        break 'modify_loop;
-                                    }
-                                    Err(e) => {
-                                        println!("  ✗ 修改后仍失败: {e}");
-                                        // 重新分类错误，走主发送流程的处理方式
-                                        match e {
-                                            SendError::Fatal(code, msg) => {
-                                                println!("    [{code}] {msg}");
-                                                let exit = prompt_with_keyboard_paused(
-                                                    keyboard_task,
-                                                    Arc::clone(&state),
-                                                    || {
-                                                        prompt::ask_confirm_default_no(
-                                                            "是否退出发送程序？",
-                                                        )
-                                                    },
-                                                )
-                                                .await?;
-                                                if exit {
-                                                    print_summary(
-                                                        success_count,
-                                                        skip_count,
-                                                        fail_count,
-                                                    );
-                                                    return Ok(());
-                                                }
-                                                // 不退出 → 回到修改循环，让用户选择 skip/modify/exit
-                                                continue 'modify_loop;
-                                            }
-                                            SendError::ReAuth(msg) => {
-                                                println!("    ⚠ {msg}");
-                                                let new_sessdata = prompt_with_keyboard_paused(
-                                                    keyboard_task,
-                                                    Arc::clone(&state),
-                                                    || {
-                                                        prompt::ask_hidden_input(
-                                                            "请输入新的 SESSDATA",
-                                                        )
-                                                    },
-                                                )
-                                                .await?;
-                                                let new_csrf = prompt_with_keyboard_paused(
-                                                    keyboard_task,
-                                                    Arc::clone(&state),
-                                                    || {
-                                                        prompt::ask_hidden_input(
-                                                            "请输入新的 bili_jct",
-                                                        )
-                                                    },
-                                                )
-                                                .await?;
-                                                task_file.update_credentials(
-                                                    task_path,
-                                                    new_sessdata,
-                                                    new_csrf,
-                                                )?;
-                                                println!("    ✓ 凭据已更新，重试修改后的弹幕...");
-
-                                                match send_one_danmaku(
-                                                    task_file, &modified, wbi_keys,
-                                                )
-                                                .await
-                                                {
-                                                    Ok(_) => {
-                                                        println!("    ✓ 重试成功");
-                                                        task_file.replace_danmaku(
-                                                            task_path, &modified,
-                                                        )?;
-                                                        success_count += 1;
-                                                        task_file
-                                                            .update_progress(task_path, dm.id)?;
-                                                        break 'modify_loop;
-                                                    }
-                                                    Err(e3) => {
-                                                        println!("    ✗ 重试失败: {e3}");
-                                                        // 继续循环，让用户再次选择
-                                                        continue 'modify_loop;
-                                                    }
-                                                }
-                                            }
-                                            SendError::Retry(code, msg) => {
-                                                println!("    [{code}] {msg}，进入重试流程...");
-                                                let retry_result = retry_loop_with_pause(
-                                                    &state,
-                                                    retry_interval_ms,
-                                                    auto_retry.clone(),
-                                                    &modified,
-                                                    task_file,
-                                                    task_path,
-                                                    wbi_keys,
-                                                    keyboard_task,
-                                                    Arc::clone(&state),
-                                                    auto_mode,
-                                                )
-                                                .await;
-                                                match retry_result {
-                                                    RetryOutcome::Success => {
-                                                        println!("    ✓ 重试成功");
-                                                        task_file.replace_danmaku(
-                                                            task_path, &modified,
-                                                        )?;
-                                                        success_count += 1;
-                                                        task_file
-                                                            .update_progress(task_path, dm.id)?;
-                                                        break 'modify_loop;
-                                                    }
-                                                    RetryOutcome::Skipped => {
-                                                        println!("    ⏭ 用户跳过");
-                                                        skip_count += 1;
-                                                        task_file
-                                                            .update_progress(task_path, dm.id)?;
-                                                        break 'modify_loop;
-                                                    }
-                                                    RetryOutcome::Exited => {
-                                                        print_summary(
-                                                            success_count,
-                                                            skip_count,
-                                                            fail_count,
-                                                        );
-                                                        return Ok(());
-                                                    }
-                                                }
-                                            }
-                                            SendError::Modify(_, _) => {
-                                                // 仍为可修改类错误，回到修改循环
-                                                continue 'modify_loop;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } // end else (non-auto modify handling)
+        match outcome {
+            DanmakuOutcome::Sent => success_count += 1,
+            DanmakuOutcome::Skipped => skip_count += 1,
+            DanmakuOutcome::Failed => fail_count += 1,
+            DanmakuOutcome::Exit { failed } => {
+                if failed {
+                    fail_count += 1;
+                }
+                print_summary(success_count, skip_count, fail_count);
+                return Ok(());
             }
         }
 
-        // ── 等间隔（分段，便于响应按键） ──
-        if interval_ms > 0 {
+        // 最后一条弹幕发送完成后无需再等待发送间隔
+        if pos + 1 < total && interval_ms > 0 {
             let mut elapsed = 0u64;
             while elapsed < interval_ms {
                 let (paused, should_exit) = *state.lock().await;
@@ -827,12 +605,12 @@ async fn run_send_loop(
                         println!("⏸  暂停执行完成，是否继续？(按 c 继续 / 按 q 退出)");
                         pause_notified = true;
                     }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                     continue;
                 }
                 pause_notified = false;
-                let chunk_ms = (interval_ms - elapsed).min(500);
-                tokio::time::sleep(tokio::time::Duration::from_millis(chunk_ms)).await;
+                let chunk_ms = (interval_ms - elapsed).min(200);
+                tokio::time::sleep(Duration::from_millis(chunk_ms)).await;
                 elapsed += chunk_ms;
             }
         }
@@ -840,6 +618,263 @@ async fn run_send_loop(
 
     print_summary(success_count, skip_count, fail_count);
     Ok(())
+}
+
+/// 统一处理单条弹幕的发送结果，支持 Retry 重分类与 ReAuth/Modify 闭环
+#[allow(clippy::too_many_arguments)]
+async fn handle_danmaku_result(
+    initial_result: Result<(), SendError>,
+    dm: &DanmakuTask,
+    task_path: &str,
+    task_file: &mut TaskFile,
+    wbi_keys: &WbiKeys,
+    retry_interval_ms: u64,
+    auto_retry: &AutoRetry,
+    keyboard_task: &mut Option<KeyboardListener>,
+    state: &Arc<tokio::sync::Mutex<(bool, bool)>>,
+    auto_mode: bool,
+) -> AppResult<DanmakuOutcome> {
+    let mut current_dm = dm.clone();
+    let mut modified_any = false;
+    let mut current_result = initial_result;
+    let mut first_attempt = true;
+
+    loop {
+        match current_result {
+            Ok(_) => {
+                if first_attempt {
+                    println!("✓ 成功");
+                } else {
+                    println!("  ✓ 发送成功");
+                }
+                if modified_any {
+                    task_file.replace_danmaku(task_path, &current_dm)?;
+                }
+                task_file.update_progress(task_path, dm.id)?;
+                return Ok(DanmakuOutcome::Sent);
+            }
+            Err(SendError::Fatal(code, msg)) => {
+                println!("✗ [{code}] {msg}");
+                if auto_mode {
+                    println!("  自动模式：遇到致命错误");
+                    return Ok(DanmakuOutcome::Exit { failed: true });
+                }
+                let exit = prompt_with_keyboard_paused(keyboard_task, Arc::clone(state), || {
+                    prompt::ask_confirm_default_no("是否退出发送程序？")
+                })
+                .await?;
+                if exit {
+                    return Ok(DanmakuOutcome::Exit { failed: true });
+                }
+                return Ok(DanmakuOutcome::Failed);
+            }
+            Err(SendError::ReAuth(msg)) => {
+                println!("⚠ {msg}");
+                if auto_mode {
+                    println!("  自动模式：需要重新认证");
+                    return Ok(DanmakuOutcome::Exit { failed: true });
+                }
+                let new_sessdata =
+                    prompt_with_keyboard_paused(keyboard_task, Arc::clone(state), || {
+                        prompt_non_empty_hidden("请输入新的 SESSDATA", "SESSDATA")
+                    })
+                    .await?;
+                let new_csrf =
+                    prompt_with_keyboard_paused(keyboard_task, Arc::clone(state), || {
+                        prompt_non_empty_hidden("请输入新的 bili_jct", "bili_jct")
+                    })
+                    .await?;
+                task_file.update_credentials(task_path, new_sessdata, new_csrf)?;
+                println!("✓ 凭据已更新，重试当前弹幕...");
+
+                first_attempt = false;
+                current_result = send_one_danmaku(task_file, &current_dm, wbi_keys).await;
+                if let Err(SendError::ReAuth(ref err_msg)) = current_result {
+                    println!("  ✗ 重试仍需要认证: {err_msg}");
+                    let retry_auth =
+                        prompt_with_keyboard_paused(keyboard_task, Arc::clone(state), || {
+                            prompt::ask_confirm("凭据似乎仍无效，是否继续重新输入？")
+                        })
+                        .await?;
+                    if !retry_auth {
+                        return Ok(DanmakuOutcome::Failed);
+                    }
+                }
+                continue;
+            }
+            Err(SendError::Retry(code, msg)) => {
+                println!(
+                    "[{code}] {msg}，进入重试流程（自动尝试{}）...",
+                    format_retry_frequency(auto_retry)
+                );
+                let retry_result = retry_loop_with_pause(
+                    state,
+                    retry_interval_ms,
+                    auto_retry.clone(),
+                    &current_dm,
+                    task_file,
+                    wbi_keys,
+                    keyboard_task,
+                    Arc::clone(state),
+                    auto_mode,
+                )
+                .await;
+                match retry_result {
+                    RetryOutcome::Success => {
+                        first_attempt = false;
+                        current_result = Ok(());
+                        continue;
+                    }
+                    RetryOutcome::Skipped => {
+                        println!("  ⏭ 已跳过");
+                        task_file.update_progress(task_path, dm.id)?;
+                        return Ok(DanmakuOutcome::Skipped);
+                    }
+                    RetryOutcome::Exited => {
+                        return Ok(DanmakuOutcome::Exit { failed: false });
+                    }
+                    RetryOutcome::Reclassified(new_err) => {
+                        println!("  ⚠ 重试期间错误类型变化，转为对应处理流程");
+                        first_attempt = false;
+                        current_result = Err(new_err);
+                        continue;
+                    }
+                }
+            }
+            Err(SendError::Modify(code, msg)) => {
+                println!("[{code}] {msg}");
+                if auto_mode {
+                    println!("  自动模式：直接跳过此条弹幕");
+                    task_file.update_progress(task_path, dm.id)?;
+                    return Ok(DanmakuOutcome::Skipped);
+                }
+
+                let meta = serde_json::to_string_pretty(&current_dm)
+                    .unwrap_or_else(|_| format!("{current_dm:?}"));
+                println!("  失败弹幕数据:");
+                println!("{meta}");
+
+                let choice = prompt_with_keyboard_paused(keyboard_task, Arc::clone(state), || {
+                    prompt::ask_modify_choice()
+                })
+                .await?;
+
+                match choice {
+                    ModifyChoice::Skip => {
+                        println!("  ⏭ 已跳过");
+                        task_file.update_progress(task_path, dm.id)?;
+                        return Ok(DanmakuOutcome::Skipped);
+                    }
+                    ModifyChoice::Exit => {
+                        return Ok(DanmakuOutcome::Exit { failed: false });
+                    }
+                    ModifyChoice::Modify => {
+                        current_dm =
+                            prompt_modified_danmaku(&current_dm, keyboard_task, Arc::clone(state))
+                                .await?;
+                        modified_any = true;
+                        first_attempt = false;
+                        current_result = send_one_danmaku(task_file, &current_dm, wbi_keys).await;
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn prompt_modified_danmaku(
+    base: &DanmakuTask,
+    keyboard_task: &mut Option<KeyboardListener>,
+    state: Arc<tokio::sync::Mutex<(bool, bool)>>,
+) -> AppResult<DanmakuTask> {
+    let new_mode = prompt_parsed_with_default(
+        "mode",
+        &base.mode.to_string(),
+        keyboard_task,
+        Arc::clone(&state),
+        |s| s.parse::<u8>().ok(),
+        "请输入合法的 mode（0~255 整数）",
+    )
+    .await?;
+
+    let new_msg = prompt_with_keyboard_paused(keyboard_task, Arc::clone(&state), || {
+        prompt::ask_input_with_default("msg", &base.msg)
+    })
+    .await?;
+
+    let new_progress = prompt_parsed_with_default(
+        "progress/ms",
+        &base.progress.to_string(),
+        keyboard_task,
+        Arc::clone(&state),
+        |s| s.parse::<u64>().ok(),
+        "请输入合法的 progress（非负整数毫秒）",
+    )
+    .await?;
+
+    let new_color = prompt_parsed_with_default(
+        "color",
+        &base.color.to_string(),
+        keyboard_task,
+        Arc::clone(&state),
+        |s| s.parse::<u32>().ok().filter(|&c| c <= 16_777_215),
+        "请输入合法的 color（0~16777215 整数）",
+    )
+    .await?;
+
+    let new_fontsize = prompt_parsed_with_default(
+        "fontsize",
+        &base.fontsize.to_string(),
+        keyboard_task,
+        Arc::clone(&state),
+        |s| s.parse::<u8>().ok().filter(|&f| f > 0),
+        "请输入合法的 fontsize（1~255 整数）",
+    )
+    .await?;
+
+    Ok(DanmakuTask {
+        id: base.id,
+        mode: new_mode,
+        msg: new_msg,
+        progress: new_progress,
+        color: new_color,
+        fontsize: new_fontsize,
+    })
+}
+
+async fn prompt_parsed_with_default<T, P>(
+    label: &str,
+    default: &str,
+    keyboard_task: &mut Option<KeyboardListener>,
+    state: Arc<tokio::sync::Mutex<(bool, bool)>>,
+    parser: P,
+    err_msg: &str,
+) -> AppResult<T>
+where
+    P: Fn(&str) -> Option<T>,
+{
+    loop {
+        let raw = prompt_with_keyboard_paused(keyboard_task, Arc::clone(&state), || {
+            prompt::ask_input_with_default(label, default)
+        })
+        .await?;
+        if let Some(val) = parser(&raw) {
+            return Ok(val);
+        }
+        println!("  ⚠ {err_msg}");
+    }
+}
+
+fn prompt_non_empty_hidden(prompt_text: &str, field_name: &str) -> AppResult<String> {
+    loop {
+        let input = prompt::ask_hidden_input(prompt_text)?;
+        if input.trim().is_empty() {
+            println!("⚠ {field_name} 不能为空，请重新输入");
+            continue;
+        }
+        return Ok(input);
+    }
 }
 
 /// 打印发送汇总
@@ -851,7 +886,6 @@ fn print_summary(success: u64, skip: u64, fail: u64) {
     println!("  - 跳过: {skip} 条");
     println!("  - 失败: {fail} 条");
     println!("═══════════════════════════════════════");
-    force_exit(0);
 }
 
 fn format_millis(ms: u64) -> String {
@@ -896,6 +930,7 @@ enum RetryOutcome {
     Success,
     Skipped,
     Exited,
+    Reclassified(SendError),
 }
 
 fn classify_response(code: i32, message: &str) -> SendError {
@@ -948,37 +983,39 @@ async fn send_one_danmaku(
 /// 带暂停/退出响应的重试循环
 /// 默认自动重试5次，若全部失败询问是否继续，选Y则再试5次，循环
 /// auto_mode: 有限次数全部失败后直接跳过，不询问用户
+/// 若重试期间错误类型变为 Fatal/ReAuth/Modify，立即停止重试并转交外层处理
+#[allow(clippy::too_many_arguments)]
 async fn retry_loop_with_pause(
     state: &tokio::sync::Mutex<(bool, bool)>,
     wait_ms: u64,
     auto_retry: AutoRetry,
     dm: &DanmakuTask,
     task_file: &TaskFile,
-    _task_path: &str,
     wbi_keys: &WbiKeys,
-    keyboard_task: &mut Option<tokio::task::JoinHandle<()>>,
+    keyboard_task: &mut Option<KeyboardListener>,
     state_clone: Arc<tokio::sync::Mutex<(bool, bool)>>,
     auto_mode: bool,
 ) -> RetryOutcome {
     if matches!(auto_retry, AutoRetry::Infinite) {
         let mut attempt = 1u64;
         loop {
-            if attempt > 1 {
-                let result = wait_with_pause(state, wait_ms).await;
-                match result {
-                    WaitResult::Timeout => {}
-                    WaitResult::Exited => return RetryOutcome::Exited,
-                    WaitResult::Paused => match wait_for_resume(state).await {
-                        ResumeResult::Resumed => {}
-                        ResumeResult::Exited => return RetryOutcome::Exited,
-                    },
-                }
+            match wait_with_pause(state, wait_ms).await {
+                WaitResult::Timeout => {}
+                WaitResult::Exited => return RetryOutcome::Exited,
+                WaitResult::Paused => match wait_for_resume(state).await {
+                    ResumeResult::Resumed => {}
+                    ResumeResult::Exited => return RetryOutcome::Exited,
+                },
             }
 
             println!("    重试 {attempt}/inf...");
             match send_one_danmaku(task_file, dm, wbi_keys).await {
                 Ok(_) => return RetryOutcome::Success,
-                Err(e) => println!("    ✗ {e}"),
+                Err(e @ SendError::Retry(_, _)) => println!("    ✗ {e}"),
+                Err(other) => {
+                    println!("    ✗ {other}");
+                    return RetryOutcome::Reclassified(other);
+                }
             }
             attempt += 1;
         }
@@ -991,24 +1028,24 @@ async fn retry_loop_with_pause(
 
     loop {
         for attempt in 1..=attempts {
-            // 等待并响应暂停/退出
-            if attempt > 1 {
-                let result = wait_with_pause(state, wait_ms).await;
-                match result {
-                    WaitResult::Timeout => {}
-                    WaitResult::Exited => return RetryOutcome::Exited,
-                    WaitResult::Paused => match wait_for_resume(state).await {
-                        ResumeResult::Resumed => {}
-                        ResumeResult::Exited => return RetryOutcome::Exited,
-                    },
-                }
+            match wait_with_pause(state, wait_ms).await {
+                WaitResult::Timeout => {}
+                WaitResult::Exited => return RetryOutcome::Exited,
+                WaitResult::Paused => match wait_for_resume(state).await {
+                    ResumeResult::Resumed => {}
+                    ResumeResult::Exited => return RetryOutcome::Exited,
+                },
             }
 
             println!("    重试 {attempt}/{attempts}...");
             match send_one_danmaku(task_file, dm, wbi_keys).await {
                 Ok(_) => return RetryOutcome::Success,
-                Err(e) => {
+                Err(e @ SendError::Retry(_, _)) => {
                     println!("    ✗ {e}");
+                }
+                Err(other) => {
+                    println!("    ✗ {other}");
+                    return RetryOutcome::Reclassified(other);
                 }
             }
         }
@@ -1052,9 +1089,17 @@ async fn wait_with_pause(state: &tokio::sync::Mutex<(bool, bool)>, ms: u64) -> W
         if paused {
             return WaitResult::Paused;
         }
-        let chunk_ms = (ms - elapsed).min(500);
-        tokio::time::sleep(tokio::time::Duration::from_millis(chunk_ms)).await;
+        let chunk_ms = (ms - elapsed).min(200);
+        tokio::time::sleep(Duration::from_millis(chunk_ms)).await;
         elapsed += chunk_ms;
+    }
+    // 处理 ms == 0 时也先检查一次退出/暂停状态
+    let (paused, should_exit) = *state.lock().await;
+    if should_exit {
+        return WaitResult::Exited;
+    }
+    if paused {
+        return WaitResult::Paused;
     }
     WaitResult::Timeout
 }
@@ -1070,7 +1115,7 @@ async fn wait_for_resume(state: &tokio::sync::Mutex<(bool, bool)>) -> ResumeResu
         if !paused {
             return ResumeResult::Resumed;
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -1085,10 +1130,9 @@ fn generate_default_filename(bvid: &str, page: u32) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let ts = now.as_secs();
-    // 利用 RandomState 产生随机 u64，无需额外依赖
     let random: u64 = {
         let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_usize(42); // seed
+        h.write_usize(42);
         h.write_u128(now.as_nanos());
         h.finish()
     };
@@ -1102,7 +1146,6 @@ fn ensure_default_tasks_dir() -> std::path::PathBuf {
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let tasks_dir = exe_dir.join("tasks");
-    // 忽略创建错误（比如已存在），后面写文件时再报错
     let _ = std::fs::create_dir_all(&tasks_dir);
     tasks_dir
 }
@@ -1120,12 +1163,10 @@ fn resolve_custom_output_path(raw: &str, bvid: &str, page: u32) -> AppResult<Str
     let path = std::path::PathBuf::from(trimmed);
 
     if is_dir {
-        // 目录 → 确保存在，追加默认文件名
         std::fs::create_dir_all(&path)?;
         let filename = generate_default_filename(bvid, page);
         Ok(path.join(filename).to_string_lossy().to_string())
     } else {
-        // 文件 → 确保父目录存在
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
@@ -1135,18 +1176,27 @@ fn resolve_custom_output_path(raw: &str, bvid: &str, page: u32) -> AppResult<Str
     }
 }
 
-/// 保存任务文件：优先使用 --output 指定路径，失败则回退到默认 tasks/ 目录
+fn try_save_custom_path(
+    task_file: &TaskFile,
+    raw: &str,
+    bvid: &str,
+    page: u32,
+) -> AppResult<String> {
+    let resolved = resolve_custom_output_path(raw, bvid, page)?;
+    task_file.to_file(&resolved)?;
+    Ok(resolved)
+}
+
+/// 保存任务文件：优先使用 --output 指定路径，IO 失败（含目录创建失败）则回退到默认 tasks/ 目录
 fn save_task_file_robust(
     task_file: &TaskFile,
     custom_path: Option<&str>,
     bvid: &str,
     page: u32,
 ) -> AppResult<String> {
-    // 若用户指定了路径，尝试解析并使用
     if let Some(raw) = custom_path {
-        let resolved = resolve_custom_output_path(raw, bvid, page)?;
-        match task_file.to_file(&resolved) {
-            Ok(()) => return Ok(resolved),
+        match try_save_custom_path(task_file, raw, bvid, page) {
+            Ok(resolved) => return Ok(resolved),
             Err(AppError::Io(e)) => {
                 println!("⚠ 写入指定路径失败: {}，回退到默认 tasks/ 目录", e);
             }
@@ -1154,7 +1204,6 @@ fn save_task_file_robust(
         }
     }
 
-    // 回退：使用默认 tasks/ 目录
     let tasks_dir = ensure_default_tasks_dir();
     let filename = generate_default_filename(bvid, page);
     let default_path = tasks_dir.join(&filename);
@@ -1165,10 +1214,8 @@ fn save_task_file_robust(
 
 async fn read_xml_file(path: &str) -> AppResult<String> {
     if path.starts_with("http://") || path.starts_with("https://") {
-        let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-            .build()?;
-        let resp = client.get(path).send().await?;
+        let client = api::http_client()?;
+        let resp = client.get(path).send().await?.error_for_status()?;
         let content = resp.text().await?;
         Ok(content)
     } else {
@@ -1179,50 +1226,65 @@ async fn read_xml_file(path: &str) -> AppResult<String> {
 
 fn spawn_keyboard_listener(
     state_clone: Arc<tokio::sync::Mutex<(bool, bool)>>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
+) -> Option<KeyboardListener> {
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
 
-        let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
-        let mut buf = [0u8; 1];
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let stop_for_thread = Arc::clone(&stop_flag);
 
-        loop {
-            match stdin.read_exact(&mut buf).await {
-                Ok(_) => {
-                    let c = buf[0];
-                    let mut st = state_clone.lock().await;
-                    match c {
-                        b'p' | b'P' => {
-                            *st = (true, false);
-                            println!("\n暂停信号已接收，等待当前操作完成...");
+    let handle = tokio::task::spawn_blocking(move || {
+        while !stop_for_thread.load(Ordering::Relaxed) {
+            match event::poll(Duration::from_millis(100)) {
+                Ok(true) => match event::read() {
+                    Ok(Event::Key(key))
+                        if key.kind == KeyEventKind::Press
+                            && !key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        if let KeyCode::Char(c) = key.code {
+                            let mut st = state_clone.blocking_lock();
+                            match c {
+                                'p' | 'P' => {
+                                    *st = (true, false);
+                                    println!("\n暂停信号已接收，等待当前操作完成...");
+                                }
+                                'c' | 'C' => {
+                                    *st = (false, false);
+                                    println!("\n▶  继续发送...");
+                                }
+                                'q' | 'Q' => {
+                                    *st = (false, true);
+                                    println!("\n🛑 退出信号已接收...");
+                                    break;
+                                }
+                                _ => {}
+                            }
                         }
-                        b'c' | b'C' => {
-                            *st = (false, false);
-                            println!("\n▶  继续发送...");
-                        }
-                        b'q' | b'Q' => {
-                            *st = (false, true);
-                            println!("\n🛑 退出信号已接收...");
-                            break;
-                        }
-                        _ => {}
                     }
-                }
+                    Ok(_) => {}
+                    Err(_) => break,
+                },
+                Ok(false) => {}
                 Err(_) => break,
             }
         }
-    })
+    });
+
+    Some(KeyboardListener { stop_flag, handle })
 }
 
-async fn stop_keyboard_listener(keyboard_task: &mut Option<tokio::task::JoinHandle<()>>) {
-    if let Some(handle) = keyboard_task.take() {
-        handle.abort();
-        let _ = handle.await;
+async fn stop_keyboard_listener(keyboard_task: &mut Option<KeyboardListener>) {
+    if let Some(listener) = keyboard_task.take() {
+        listener.stop_flag.store(true, Ordering::Relaxed);
+        let _ = listener.handle.await;
     }
 }
 
 async fn prompt_with_keyboard_paused<T, F>(
-    keyboard_task: &mut Option<tokio::task::JoinHandle<()>>,
+    keyboard_task: &mut Option<KeyboardListener>,
     state_clone: Arc<tokio::sync::Mutex<(bool, bool)>>,
     prompt_fn: F,
 ) -> AppResult<T>
@@ -1232,12 +1294,40 @@ where
     stop_keyboard_listener(keyboard_task).await;
     let result = prompt_fn();
     if keyboard_task.is_none() {
-        *keyboard_task = Some(spawn_keyboard_listener(state_clone));
+        *keyboard_task = spawn_keyboard_listener(state_clone);
     }
     result
 }
 
-/// 通用强行退出函数
-fn force_exit(code: i32) -> ! {
-    process::exit(code);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_save_task_file_robust_falls_back_when_custom_parent_is_file() {
+        let dir = std::env::temp_dir();
+        let blocker_file = dir.join(format!("dmsender_blocker_{}", std::process::id()));
+        std::fs::write(&blocker_file, b"not a directory").unwrap();
+
+        let bad_output = blocker_file.join("nested").join("task.json");
+        let bad_output_str = bad_output.to_string_lossy().to_string();
+
+        let task_file = TaskFile::new(
+            "BV1xx411c7mD".to_string(),
+            12345,
+            "test".to_string(),
+            "sess".to_string(),
+            "csrf".to_string(),
+            1,
+            vec![],
+        );
+
+        let saved_path =
+            save_task_file_robust(&task_file, Some(&bad_output_str), "BV1xx411c7mD", 1).unwrap();
+        assert_ne!(saved_path, bad_output_str);
+        assert!(std::path::Path::new(&saved_path).exists());
+
+        let _ = std::fs::remove_file(&saved_path);
+        let _ = std::fs::remove_file(&blocker_file);
+    }
 }

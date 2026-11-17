@@ -50,9 +50,20 @@ fn validate_danmaku_rigor(raw: &RawDanmaku, time_offset_ms: Option<i64>) -> bool
     if raw.has_parse_defaults {
         return false;
     }
-    let rawstime = (raw.stime * 1000.0) as i64 + time_offset_ms.unwrap_or(0);
+    if !raw.stime.is_finite() {
+        return false;
+    }
+    let ms_f64 = (raw.stime * 1000.0).round();
+    if ms_f64 < i64::MIN as f64 || ms_f64 > i64::MAX as f64 {
+        return false;
+    }
+    let rawstime = (ms_f64 as i64).saturating_add(time_offset_ms.unwrap_or(0));
+    // 文本不能为空
+    if raw.text.trim().is_empty() {
+        return false;
+    }
     // color: 0 ~ 16777215
-    if raw.color > 16777215 {
+    if raw.color > 16_777_215 {
         return false;
     }
     // size: 10 ~ 127
@@ -71,7 +82,7 @@ fn validate_danmaku_rigor(raw: &RawDanmaku, time_offset_ms: Option<i64>) -> bool
 /// - 剔除 mode=8 的弹幕（代码弹幕，不可发送）
 /// - 暂时剔除 mode=9 的弹幕（BAS弹幕）
 /// - 检测是否存在 mode=7 的高级弹幕
-/// - 若 rigor=true，额外验证 color/size/stime 合法性
+/// - 若 rigor=true，额外验证 color/size/stime/文本合法性
 /// - 按 date 字段排序并分配任务 ID
 /// - 若 time_offset_ms 有值，对转换后的 progress 进行 +/- 偏移
 pub fn parse_danmaku_xml(
@@ -156,8 +167,14 @@ pub fn parse_danmaku_xml(
         .enumerate()
         .map(|(idx, raw)| {
             // stime 单位是秒，progress 单位是毫秒
-            let base_progress = (raw.stime * 1000.0) as i64;
-            let adjusted = (base_progress + offset).max(0) as u64;
+            let base_progress = if raw.stime.is_finite() {
+                (raw.stime * 1000.0)
+                    .round()
+                    .clamp(i64::MIN as f64, i64::MAX as f64) as i64
+            } else {
+                0
+            };
+            let adjusted = base_progress.saturating_add(offset).max(0) as u64;
             DanmakuTask {
                 id: (idx + 1) as u64,
                 mode: raw.mode,
@@ -187,49 +204,49 @@ fn parse_p_attribute(p: &str) -> Option<RawDanmaku> {
 
     let mut has_parse_defaults = false;
 
-    let stime: f64 = match parts[0].parse() {
+    let stime: f64 = match parts[0].trim().parse() {
         Ok(v) => v,
         Err(_) => {
             has_parse_defaults = true;
             0.0
         }
     };
-    let mode: u8 = match parts[1].parse() {
+    let mode: u8 = match parts[1].trim().parse() {
         Ok(v) => v,
         Err(_) => {
             has_parse_defaults = true;
             1
         }
     };
-    let size: u8 = match parts[2].parse() {
+    let size: u8 = match parts[2].trim().parse() {
         Ok(v) => v,
         Err(_) => {
             has_parse_defaults = true;
             25
         }
     };
-    let color: u32 = match parts[3].parse() {
+    let color: u32 = match parts[3].trim().parse() {
         Ok(v) => v,
         Err(_) => {
             has_parse_defaults = true;
             16777215
         }
     };
-    let date: u64 = match parts[4].parse() {
+    let date: u64 = match parts[4].trim().parse() {
         Ok(v) => v,
         Err(_) => {
             has_parse_defaults = true;
             0
         }
     };
-    let pool: u8 = match parts[5].parse() {
+    let pool: u8 = match parts[5].trim().parse() {
         Ok(v) => v,
         Err(_) => {
             has_parse_defaults = true;
             0
         }
     };
-    let weight: u32 = match parts[8].parse() {
+    let weight: u32 = match parts[8].trim().parse() {
         Ok(v) => v,
         Err(_) => {
             has_parse_defaults = true;
@@ -244,8 +261,8 @@ fn parse_p_attribute(p: &str) -> Option<RawDanmaku> {
         color,
         date,
         pool,
-        uhash: parts[6].to_string(),
-        dmid: parts[7].to_string(),
+        uhash: parts[6].trim().to_string(),
+        dmid: parts[7].trim().to_string(),
         weight,
         text: String::new(),
         has_parse_defaults,
@@ -286,18 +303,31 @@ fn classify_and_push(
     danmakus.push(raw);
 }
 
-/// 读取 <d> 标签内的文本内容
+/// 读取 <d> 标签内的文本内容（同时支持普通文本、CDATA 与非严格实体回退）
 fn read_d_text(reader: &mut Reader<&[u8]>, buf: &mut Vec<u8>) -> AppResult<String> {
     let mut text = String::new();
     loop {
         match reader.read_event_into(buf) {
-            Ok(Event::Text(e)) => {
-                text.push_str(&e.unescape().unwrap_or_default());
-            }
+            Ok(Event::Text(e)) => match e.unescape() {
+                Ok(s) => text.push_str(&s),
+                Err(_) => {
+                    text.push_str(&String::from_utf8_lossy(e.as_ref()));
+                }
+            },
+            Ok(Event::CData(e)) => match e.decode() {
+                Ok(s) => text.push_str(&s),
+                Err(_) => {
+                    text.push_str(&String::from_utf8_lossy(e.as_ref()));
+                }
+            },
             Ok(Event::End(e)) if e.name().as_ref() == b"d" => {
                 break;
             }
-            Ok(Event::Eof) => break,
+            Ok(Event::Eof) => {
+                return Err(AppError::XmlParse(
+                    "XML 格式错误: <d> 标签未正常闭合".to_string(),
+                ));
+            }
             Err(e) => return Err(AppError::XmlParse(format!("读取弹幕文本失败: {e}"))),
             _ => {}
         }
@@ -421,5 +451,45 @@ mod tests {
 
         let result = parse_danmaku_xml(xml, false, Some(-1000), &[]).unwrap();
         assert_eq!(result.tasks[0].progress, 0); // 不能小于 0
+    }
+
+    #[test]
+    fn test_parse_xml_preserves_cdata_and_bare_ampersand() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<i>
+    <d p="1.0,7,25,16777215,1000,0,hash1,dmid1,1"><![CDATA[["a&b","<tag>"]]]></d>
+    <d p="2.0,1,25,16777215,2000,0,hash2,dmid2,1">Tom & Jerry</d>
+</i>"#;
+
+        let result = parse_danmaku_xml(xml, false, None, &[]).unwrap();
+        assert_eq!(result.tasks.len(), 2);
+        assert_eq!(result.tasks[0].msg, r#"["a&b","<tag>"]"#);
+        assert_eq!(result.tasks[1].msg, "Tom & Jerry");
+    }
+
+    #[test]
+    fn test_rigor_filters_nan_and_empty_text() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<i>
+    <d p="NaN,1,25,16777215,1000,0,hash1,dmid1,1">无效时间</d>
+    <d p="1.0,1,25,16777215,2000,0,hash2,dmid2,1"/>
+    <d p="2.0,1,25,16777215,3000,0,hash3,dmid3,1">有效弹幕</d>
+</i>"#;
+
+        let result = parse_danmaku_xml(xml, true, None, &[]).unwrap();
+        assert_eq!(result.rigor_removed_count, 2);
+        assert_eq!(result.tasks.len(), 1);
+        assert_eq!(result.tasks[0].msg, "有效弹幕");
+    }
+
+    #[test]
+    fn test_timeoffset_overflow_saturates_without_panic() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<i>
+    <d p="10.0,1,25,16777215,1000,0,hash1,dmid1,1">测试</d>
+</i>"#;
+
+        let result = parse_danmaku_xml(xml, false, Some(i64::MAX), &[]).unwrap();
+        assert_eq!(result.tasks[0].progress, i64::MAX as u64);
     }
 }

@@ -1,4 +1,9 @@
+use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde::{Deserialize, Serialize};
+
+static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// 单条弹幕任务
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,10 +81,25 @@ impl TaskFile {
         Ok(task_file)
     }
 
-    /// 将任务文件写入磁盘
+    /// 将任务文件原子写入磁盘（先写临时文件再重命名，避免中断导致文件损坏）
     pub fn to_file(&self, path: &str) -> Result<(), crate::errors::AppError> {
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json)?;
+        let seq = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = format!("{path}.tmp.{}.{seq}", std::process::id());
+
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&tmp_path)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp_path, path)?;
+            Ok(())
+        })();
+
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -141,4 +161,41 @@ pub fn is_task_file_expired(task_file: &TaskFile) -> bool {
         .as_secs();
     let one_week_secs: u64 = 7 * 24 * 60 * 60;
     now.saturating_sub(task_file.created_at) > one_week_secs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_task_file_atomic_save_and_overwrite() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("dmsender_test_task_{}.json", std::process::id()));
+        let path_str = path.to_string_lossy().to_string();
+
+        let mut task = TaskFile::new(
+            "BV1xx411c7mD".to_string(),
+            12345,
+            "test".to_string(),
+            "sess".to_string(),
+            "csrf".to_string(),
+            1,
+            vec![DanmakuTask {
+                id: 1,
+                mode: 1,
+                msg: "hello".to_string(),
+                progress: 1000,
+                color: 16777215,
+                fontsize: 25,
+            }],
+        );
+        task.to_file(&path_str).unwrap();
+        task.update_progress(&path_str, 1).unwrap();
+
+        let loaded = TaskFile::from_file(&path_str).unwrap();
+        assert_eq!(loaded.last_progress_id, Some(1));
+        assert_eq!(loaded.danmakus.len(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

@@ -11,19 +11,24 @@ use errors::{AppError, AppResult};
 use crate::actions::{AutoRetry, CreateInputs, CreateVideoInput, SendFrom, SendOptions};
 
 /// 解析 --timeoffset 参数，格式为 +/-TIME(ms)
-fn parse_timeoffset(raw: Option<String>) -> Option<i64> {
-    raw.as_deref().and_then(|s| {
-        let s = s.trim();
-        if s.is_empty() {
-            return None;
-        }
-        // 支持 +1000, -500, 1000 等形式
-        if let Some(stripped) = s.strip_prefix('+') {
-            stripped.parse::<i64>().ok()
-        } else {
-            s.parse::<i64>().ok()
-        }
-    })
+fn parse_timeoffset(raw: Option<String>) -> AppResult<Option<i64>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err(AppError::Business(
+            "--timeoffset 不能为空，应为整数（毫秒），例如 +1000 或 -500".to_string(),
+        ));
+    }
+    // 支持 +1000, -500, 1000 等形式
+    let normalized = s.strip_prefix('+').unwrap_or(s);
+    let offset = normalized.parse::<i64>().map_err(|_| {
+        AppError::Business(format!(
+            "--timeoffset 格式无效: {s}，应为整数（毫秒），例如 +1000 或 -500"
+        ))
+    })?;
+    Ok(Some(offset))
 }
 
 fn parse_remove_modes(raw: Option<Option<String>>) -> AppResult<Vec<u8>> {
@@ -93,14 +98,25 @@ fn parse_create_inputs(
             if bvid.is_empty() {
                 return Err(AppError::Business("--bvid 不能为空".to_string()));
             }
-            if !bvid.to_uppercase().starts_with("BV") {
+            if !bvid.to_uppercase().starts_with("BV")
+                || bvid.len() < 3
+                || !bvid.chars().all(|c| c.is_ascii_alphanumeric())
+            {
                 return Err(AppError::Business(
-                    "--bvid 格式不正确，应以 BV 开头".to_string(),
+                    "--bvid 格式不正确，应以 BV 开头且仅包含字母和数字".to_string(),
                 ));
+            }
+            if page == 0 {
+                return Err(AppError::Business("--page 必须大于 0".to_string()));
             }
             CreateVideoInput::BvidPage { bvid, page }
         }
-        (None, None, Some(cid)) => CreateVideoInput::Cid(cid),
+        (None, None, Some(cid)) => {
+            if cid == 0 {
+                return Err(AppError::Business("--cid 必须大于 0".to_string()));
+            }
+            CreateVideoInput::Cid(cid)
+        }
         (Some(_), Some(_), Some(_)) => {
             return Err(AppError::Business(
                 "视频信息只能指定 --bvid + --page 或 --cid，不能同时使用".to_string(),
@@ -189,7 +205,14 @@ fn parse_auto_retry(raw: Option<String>) -> AppResult<AutoRetry> {
 }
 
 #[tokio::main]
-async fn main() -> AppResult<()> {
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("错误: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> AppResult<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -214,13 +237,14 @@ async fn main() -> AppResult<()> {
         } => {
             let create_inputs = parse_create_inputs(sessdata, bili_jct, bvid, page, cid, pool)?;
             let remove_modes = parse_remove_modes(remove)?;
+            let time_offset_ms = parse_timeoffset(timeoffset)?;
             let send_options =
                 parse_send_options(interval, sendfrom, retryinterval, autoretryfrequency)?;
             let task_path = actions::handle_create(
                 xml_path,
                 rigor,
                 output,
-                parse_timeoffset(timeoffset),
+                time_offset_ms,
                 create_inputs,
                 remove_modes,
                 auto && sendafter,
@@ -283,5 +307,75 @@ mod tests {
             None,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_timeoffset_valid_and_invalid() {
+        assert_eq!(parse_timeoffset(None).unwrap(), None);
+        assert_eq!(
+            parse_timeoffset(Some("+1000".to_string())).unwrap(),
+            Some(1000)
+        );
+        assert_eq!(
+            parse_timeoffset(Some("-500".to_string())).unwrap(),
+            Some(-500)
+        );
+        assert_eq!(
+            parse_timeoffset(Some("250".to_string())).unwrap(),
+            Some(250)
+        );
+        assert!(parse_timeoffset(Some("abc".to_string())).is_err());
+        assert!(parse_timeoffset(Some("  ".to_string())).is_err());
+    }
+
+    #[test]
+    fn test_cli_parses_negative_timeoffset_with_space() {
+        let cli = Cli::try_parse_from(["DMsender", "create", "sample.xml", "--timeoffset", "-500"])
+            .unwrap();
+        match cli.command {
+            Command::Create { timeoffset, .. } => {
+                assert_eq!(parse_timeoffset(timeoffset).unwrap(), Some(-500));
+            }
+            _ => panic!("expected Create command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_inputs_rejects_zero_page_cid_and_bad_bvid() {
+        assert!(
+            parse_create_inputs(
+                Some("sess".to_string()),
+                Some("csrf".to_string()),
+                Some("BV1xx411c7mD".to_string()),
+                Some(0),
+                None,
+                Some(1),
+            )
+            .is_err()
+        );
+
+        assert!(
+            parse_create_inputs(
+                Some("sess".to_string()),
+                Some("csrf".to_string()),
+                None,
+                None,
+                Some(0),
+                Some(1),
+            )
+            .is_err()
+        );
+
+        assert!(
+            parse_create_inputs(
+                Some("sess".to_string()),
+                Some("csrf".to_string()),
+                Some("BV1xx&foo=1".to_string()),
+                Some(1),
+                None,
+                Some(1),
+            )
+            .is_err()
+        );
     }
 }
